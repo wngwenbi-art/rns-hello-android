@@ -127,7 +127,7 @@ class AndroidBTInterface(Interface):
             if byte == KISS_FEND:
                 if self._in_frame and len(self._kiss_buf) > 1:
                     if self._kiss_buf[0] == CMD_DATA:
-                        self.processIncoming(bytes(self._kiss_buf[1:]))
+                        self.process_incoming(bytes(self._kiss_buf[1:]))
                 self._kiss_buf = []
                 self._in_frame = True
                 self._escape   = False
