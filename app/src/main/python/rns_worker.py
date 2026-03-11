@@ -2,25 +2,27 @@ import RNS
 import LXMF
 import threading
 
+# In RNS 1.x, Interface must be imported directly from the module
+from RNS.Interfaces.Interface import Interface
+
 destination = None
 lxmf_router = None
 
-class AndroidBTInterface(RNS.Interfaces.Interface):
+class AndroidBTInterface(Interface):
     BITRATE_GUESS = 9600
 
-    def __init__(self, socket):
-        # RNS newer versions use this init signature
-        self.name = "RNodeBT"
+    def __init__(self, owner, name, socket):
+        self.name = name
         self.rxb = 0
         self.txb = 0
-        self.online = True
-        self.online = True
-        self.IN = True
+        self.online = False
+        self.IN  = True
         self.OUT = True
         self.FWD = False
         self.RPT = False
-        self.owner = None
+        self.owner = owner
         self._socket = socket
+        self.online = True
         threading.Thread(target=self._read_loop, daemon=True).start()
 
     def _read_loop(self):
@@ -47,14 +49,12 @@ def message_received(message):
 def start(bt_socket_wrapper):
     global destination, lxmf_router
 
-    # Start Reticulum with no config file
     reticulum = RNS.Reticulum(configdir=None, loglevel=RNS.LOG_DEBUG)
 
-    # Manually register our BT interface
-    iface = AndroidBTInterface(bt_socket_wrapper)
+    # Create and register interface with correct owner argument
+    iface = AndroidBTInterface(reticulum, "RNodeBT", bt_socket_wrapper)
     RNS.Transport.interfaces.append(iface)
 
-    # Create identity and LXMF destination
     identity = RNS.Identity()
     lxmf_router = LXMF.LXMRouter(
         storagepath="/data/data/com.example.rnshello/files/lxmf",
@@ -65,11 +65,10 @@ def start(bt_socket_wrapper):
         display_name="RNS Hello Android"
     )
     lxmf_router.register_delivery_callback(message_received)
-
-    # Announce our address on the network
     destination.announce()
+
     addr = RNS.prettyhexrep(destination.hash)
-    RNS.log(f"LXMF address announced: {addr}")
+    RNS.log(f"LXMF address: {addr}")
     return addr
 
 def send_hello(dest_hash_hex):
