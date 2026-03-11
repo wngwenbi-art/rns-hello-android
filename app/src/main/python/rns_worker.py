@@ -209,7 +209,7 @@ def _rns_main(bt_socket_wrapper):
         reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
 
         iface = AndroidBTInterface(reticulum, "RNodeBT", bt_socket_wrapper)
-        RNS.Transport.interfaces.append(iface)
+        RNS.Transport.register_interface(iface)
 
         identity = RNS.Identity()
 
