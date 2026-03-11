@@ -79,6 +79,8 @@ class AndroidBTInterface(Interface):
     BITRATE_GUESS = 1200
 
     def __init__(self, owner, name, socket):
+        super().__init__()
+        self.owner                  = owner   # RNS Transport instance
         self.name                   = name
         self.rxb                    = 0
         self.txb                    = 0
@@ -87,7 +89,6 @@ class AndroidBTInterface(Interface):
         self.OUT                    = True
         self.FWD                    = False
         self.RPT                    = False
-        self.owner                  = owner
         self._socket                = socket
         self.bitrate                = self.BITRATE_GUESS
         self.ingress_control        = False
@@ -127,9 +128,9 @@ class AndroidBTInterface(Interface):
             if byte == KISS_FEND:
                 if self._in_frame and len(self._kiss_buf) > 1:
                     if self._kiss_buf[0] == CMD_DATA:
-                        data = bytes(self._kiss_buf[1:])
-                        self.rxb += len(data)
-                        RNS.Transport.inbound(data, self)
+                        pkt = bytes(self._kiss_buf[1:])
+                        self.rxb += len(pkt)
+                        self.owner.inbound(pkt, self)
                 self._kiss_buf = []
                 self._in_frame = True
                 self._escape   = False
@@ -145,14 +146,12 @@ class AndroidBTInterface(Interface):
                 else:
                     self._kiss_buf.append(byte)
 
-    def processOutgoing(self, data):
+    def process_outgoing(self, data):
         try:
             self._socket.write(kiss_cmd(CMD_DATA, data))
             self.txb += len(data)
         except Exception as e:
             RNS.log(f"BT write error: {e}")
-
-    process_outgoing = processOutgoing
 
 def message_received(message):
     sender = RNS.prettyhexrep(message.source_hash)
@@ -208,8 +207,8 @@ def _rns_main(bt_socket_wrapper):
 
         reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
 
-        iface = AndroidBTInterface(reticulum, "RNodeBT", bt_socket_wrapper)
-        RNS.Transport.register_interface(iface)
+        iface = AndroidBTInterface(RNS.Transport, "RNodeBT", bt_socket_wrapper)
+        RNS.Transport.interfaces.append(iface)
 
         identity = RNS.Identity()
 
