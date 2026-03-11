@@ -124,7 +124,8 @@ class MainActivity : AppCompatActivity() {
                     msg["display_from"] ?: msg["from"] ?: "",
                     msg["text"] ?: "",
                     msg["ts"] ?: "",
-                    msg["direction"] == "out"
+                    msg["direction"] == "out",
+                    (msg["from"] ?: "").replace("<", "").replace(">", "")
                 )
             }
             scrollChat.post { scrollChat.fullScroll(View.FOCUS_DOWN) }
@@ -143,7 +144,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun addChatBubble(from: String, text: String, ts: String, isOutgoing: Boolean) {
+    private fun addChatBubble(from: String, text: String, ts: String, isOutgoing: Boolean, rawHash: String = "") {
         val wrapper = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(
@@ -154,12 +155,34 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (!isOutgoing) {
-            wrapper.addView(TextView(this).apply {
+            val senderLabel = TextView(this).apply {
                 this.text = from
                 textSize = 9f
                 setTextColor(Color.parseColor("#00d4ff"))
                 typeface = android.graphics.Typeface.MONOSPACE
-            })
+            }
+            if (rawHash.isNotEmpty()) {
+                senderLabel.setOnLongClickListener {
+                    val input = android.widget.EditText(this)
+                    input.setText(RNSBridge.getContact(rawHash))
+                    input.hint = "Enter nickname (blank to clear)"
+                    androidx.appcompat.app.AlertDialog.Builder(this)
+                        .setTitle("Set nickname")
+                        .setMessage(rawHash)
+                        .setView(input)
+                        .setPositiveButton("Save") { _, _ ->
+                            val nick = input.text.toString()
+                            RNSBridge.setContact(rawHash, nick)
+                            senderLabel.text = if (nick.isBlank()) rawHash else nick
+                            toast(if (nick.isBlank()) "Nickname cleared" else "Saved: $nick")
+                            lastMessageCount = 0  // force chat refresh
+                        }
+                        .setNegativeButton("Cancel", null)
+                        .show()
+                    true
+                }
+            }
+            wrapper.addView(senderLabel)
         }
 
         wrapper.addView(TextView(this).apply {
@@ -307,7 +330,27 @@ class MainActivity : AppCompatActivity() {
                     toast("RNS error: $addr")
                     btnConnect.isEnabled = true
                 } else {
-                    tvMyAddress.text = "My address: $addr"
+                    val myAddr = addr
+                    tvMyAddress.text = "My address: $myAddr"
+                    tvMyAddress.setOnLongClickListener {
+                        val input = android.widget.EditText(this@MainActivity)
+                        input.setText(RNSBridge.getContact(myAddr))
+                        input.hint = "Enter nickname for your address"
+                        androidx.appcompat.app.AlertDialog.Builder(this@MainActivity)
+                            .setTitle("Set my address nickname")
+                            .setMessage(myAddr)
+                            .setView(input)
+                            .setPositiveButton("Save") { _, _ ->
+                                val nick = input.text.toString()
+                                RNSBridge.setContact(myAddr, nick)
+                                tvMyAddress.text = if (nick.isBlank()) "My address: $myAddr"
+                                                   else "My address: $nick"
+                                toast(if (nick.isBlank()) "Nickname cleared" else "Saved: $nick")
+                            }
+                            .setNegativeButton("Cancel", null)
+                            .show()
+                        true
+                    }
                     toast("Ready!")
                     startPolling()
                 }
