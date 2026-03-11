@@ -146,6 +146,9 @@ class AndroidBTInterface(Interface):
         except Exception as e:
             RNS.log(f"BT write error: {e}")
 
+    # RNS calls lowercase version too - alias it
+    process_outgoing = processOutgoing
+
 def message_received(message):
     RNS.log(f"MSG from {RNS.prettyhexrep(message.source_hash)}: {message.content_as_string()}")
 
@@ -218,9 +221,25 @@ def send_hello(dest_hash_hex):
     if not lxmf_router or not destination:
         return "Not connected"
     try:
-        # Build destination object from hash
         dest_hash = bytes.fromhex(dest_hash_hex)
-        lxmf_dest = RNS.Destination.recall(dest_hash)
+
+        # Look up or create the destination identity
+        id_recall = RNS.Identity.recall(dest_hash)
+        if id_recall is None:
+            # Identity not yet known - request it first then queue message
+            RNS.Identity.request(dest_hash)
+            return "Requesting identity... wait 10s and try again"
+
+        lxmf_dest = RNS.Destination(
+            id_recall,
+            RNS.Destination.OUT,
+            RNS.Destination.SINGLE,
+            "lxmf",
+            "delivery"
+        )
+        lxmf_dest.hash = dest_hash
+        lxmf_dest.hexhash = dest_hash.hex()
+
         msg = LXMF.LXMessage(
             lxmf_dest,
             destination,
@@ -229,8 +248,9 @@ def send_hello(dest_hash_hex):
             desired_method=LXMF.LXMessage.DIRECT
         )
         lxmf_router.handle_outbound(msg)
-        return "Sent"
+        return "Sent!"
     except Exception as e:
+        import traceback
         return f"Error: {e}"
 
 def get_address():
