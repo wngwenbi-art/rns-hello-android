@@ -59,7 +59,7 @@
             android:layout_width="0dp"
             android:layout_height="match_parent"
             android:layout_weight="1"
-            android:text="?? Chat"
+            android:text="Chat"
             android:textSize="13sp"
             android:backgroundTint="#00d4ff"
             android:textColor="#1a1a2e"/>
@@ -69,7 +69,7 @@
             android:layout_width="0dp"
             android:layout_height="match_parent"
             android:layout_weight="1"
-            android:text="?? Network"
+            android:text="Network"
             android:textSize="13sp"
             android:backgroundTint="#0f3460"
             android:textColor="#ffffff"/>
@@ -83,13 +83,12 @@
         android:layout_weight="1"
         android:orientation="vertical">
 
-        <!-- Dest address input -->
         <EditText
             android:id="@+id/etDestHash"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:hint="Destination address (hex)"
-            android:textColorHint="#666"
+            android:textColorHint="#666666"
             android:textColor="#ffffff"
             android:textSize="11sp"
             android:fontFamily="monospace"
@@ -98,7 +97,6 @@
             android:singleLine="true"
             android:inputType="textNoSuggestions"/>
 
-        <!-- Messages list -->
         <ScrollView
             android:id="@+id/scrollChat"
             android:layout_width="match_parent"
@@ -113,7 +111,6 @@
                 android:orientation="vertical"/>
         </ScrollView>
 
-        <!-- Message input -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -127,7 +124,7 @@
                 android:layout_height="48dp"
                 android:layout_weight="1"
                 android:hint="Type a message..."
-                android:textColorHint="#666"
+                android:textColorHint="#666666"
                 android:textColor="#ffffff"
                 android:background="#0f3460"
                 android:padding="8dp"
