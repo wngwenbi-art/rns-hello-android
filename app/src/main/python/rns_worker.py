@@ -1,7 +1,14 @@
+import sys
+import signal
+
+# Android does not support signal handling outside the main thread
+# Disable it cleanly before importing RNS
+if sys.platform == "android":
+    signal.signal = lambda *a, **k: None
+
 import RNS
 import LXMF
 import threading
-import signal
 from RNS.Interfaces.Interface import Interface
 
 destination = None
@@ -51,12 +58,8 @@ def message_received(message):
 
 def _rns_main(bt_socket_wrapper):
     global destination, lxmf_router, reticulum
-
     try:
-        # Disable signal handling in RNS so it works outside main thread
-        import unittest.mock as mock
-        with mock.patch("signal.signal", lambda *a, **k: None):
-            reticulum = RNS.Reticulum(configdir=None, loglevel=RNS.LOG_DEBUG)
+        reticulum = RNS.Reticulum(configdir=None, loglevel=RNS.LOG_DEBUG)
 
         iface = AndroidBTInterface(reticulum, "RNodeBT", bt_socket_wrapper)
         RNS.Transport.interfaces.append(iface)
@@ -85,8 +88,6 @@ def _rns_main(bt_socket_wrapper):
 
 def start(bt_socket_wrapper):
     global _rns_started
-
-    # Only ever start RNS once per app lifecycle
     if _rns_started:
         if destination:
             return RNS.prettyhexrep(destination.hash)
