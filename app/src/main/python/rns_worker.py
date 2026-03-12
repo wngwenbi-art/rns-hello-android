@@ -164,6 +164,7 @@ def message_received(message):
 def announce_received(destination_hash, announced_identity, app_data):
     global known_identities
     hash_str = RNS.prettyhexrep(destination_hash).strip("<>")
+    RNS.log(f"DEBUG announce_received called: hash={hash_str} identity={announced_identity is not None} app_data={app_data}")
     name = ""
     if app_data:
         try:
