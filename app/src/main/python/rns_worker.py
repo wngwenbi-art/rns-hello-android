@@ -150,6 +150,13 @@ class AndroidBTInterface(Interface):
         self.ifac_key               = None
         self.ifac_identity          = None
         self.ifac_signature         = None
+        # Attributes required by newer RNS versions
+        self.announce_rate_target   = None
+        self.announce_rate_grace    = None
+        self.announce_rate_penalty  = None
+        self.announce_allowed_at    = 0
+        self.announce_time          = None
+        self.stamp_cost             = None
         self.online                 = True
         self._kiss_buf              = []
         self._in_frame              = False
@@ -163,8 +170,13 @@ class AndroidBTInterface(Interface):
                 if data and len(data) > 0:
                     self._parse_kiss(data)
             except Exception as e:
-                RNS.log(f"BT read error: {e}")
-                self.online = False
+                err = str(e)
+                # Only kill the loop on actual BT/IO errors, not RNS internal errors
+                if "socket" in err.lower() or "bluetooth" in err.lower() or "read ret" in err.lower() or "closed" in err.lower():
+                    RNS.log(f"BT read error (stopping): {e}")
+                    self.online = False
+                else:
+                    RNS.log(f"BT read non-fatal error (continuing): {e}")
 
     def _parse_kiss(self, data):
         for byte in data:
@@ -173,7 +185,10 @@ class AndroidBTInterface(Interface):
                     if self._kiss_buf[0] == CMD_DATA:
                         pkt = bytes(self._kiss_buf[1:])
                         self.rxb += len(pkt)
-                        self.owner.inbound(pkt, self)
+                        try:
+                            self.owner.inbound(pkt, self)
+                        except Exception as e:
+                            RNS.log(f"inbound processing error (non-fatal): {e}")
                 self._kiss_buf = []
                 self._in_frame = True
                 self._escape   = False
@@ -215,27 +230,63 @@ def message_received(message):
     entry = {"from": sender, "text": text, "ts": ts, "direction": "in"}
     chat_messages.append(entry)
 
+def _decode_lxmf_app_data(app_data):
+    """LXMF encodes display_name as msgpack {0: "name"} — try that first, fallback to raw utf-8."""
+    if not app_data:
+        return ""
+    # Try msgpack (LXMF standard encoding)
+    try:
+        import msgpack
+        unpacked = msgpack.unpackb(app_data, raw=False)
+        if isinstance(unpacked, dict):
+            # LXMF uses key 0 for display name
+            val = unpacked.get(0, unpacked.get("name", ""))
+            return str(val) if val else ""
+        if isinstance(unpacked, str):
+            return unpacked
+        if isinstance(unpacked, bytes):
+            return unpacked.decode("utf-8", errors="replace")
+    except Exception as e:
+        RNS.log(f"msgpack decode failed: {e}, trying utf-8")
+    # Fallback: raw UTF-8
+    try:
+        decoded = app_data.decode("utf-8").strip()
+        # Sanity check — if it looks like binary garbage, return empty
+        if all(32 <= ord(c) < 127 or c in "\t\n" for c in decoded):
+            return decoded
+    except Exception:
+        pass
+    return ""
+
+
 def announce_received(destination_hash, announced_identity, app_data):
     global known_identities
-    hash_str = RNS.prettyhexrep(destination_hash)
-    name = ""
-    if app_data:
-        try:
-            name = app_data.decode("utf-8")
-        except:
-            name = str(app_data)
+    # destination_hash may be bytes — normalise to clean hex string
+    if isinstance(destination_hash, bytes):
+        hash_str = destination_hash.hex()
+    else:
+        hash_str = str(destination_hash).replace("<","").replace(">","")
+
+    name = _decode_lxmf_app_data(app_data)
     ts = time.strftime("%H:%M:%S")
-    RNS.log(f"ANNOUNCE from {hash_str} name={name}")
-    # Store the identity so we can send to this peer
+    RNS.log(f"ANNOUNCE from {hash_str} name={repr(name)} app_data={repr(app_data[:32] if app_data else None)}")
+
     if announced_identity is not None:
         known_identities[hash_str] = announced_identity
         RNS.log(f"Identity stored for {hash_str}")
+
     entry = {"hash": hash_str, "name": name, "ts": ts}
     for i, a in enumerate(seen_announces):
         if a["hash"] == hash_str:
             seen_announces[i] = entry
+            RNS.log(f"Updated existing announce for {hash_str}")
             return
     seen_announces.append(entry)
+    RNS.log(f"New announce added, total={len(seen_announces)}")
+
+
+# Keep a module-level reference so it isn't garbage collected
+_announce_handler_instance = None
 
 class AnnounceHandler:
     aspect_filter = "lxmf.delivery"
@@ -298,7 +349,9 @@ def _rns_main(bt_socket_wrapper):
             display_name="RNS Hello Android"
         )
         lxmf_router.register_delivery_callback(message_received)
-        RNS.Transport.register_announce_handler(AnnounceHandler())
+        global _announce_handler_instance
+        _announce_handler_instance = AnnounceHandler()
+        RNS.Transport.register_announce_handler(_announce_handler_instance)
 
         # Start the send queue worker
         threading.Thread(target=_queue_worker, daemon=True).start()
