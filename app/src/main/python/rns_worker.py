@@ -182,11 +182,30 @@ class AndroidBTInterface(Interface):
 
 def message_received(message):
     sender = RNS.prettyhexrep(message.source_hash).strip("<>")
-    text = message.content_as_string()
+    # Try all ways to get content
+    text = ""
+    try:
+        text = message.content_as_string()
+    except:
+        pass
+    if not text:
+        try:
+            raw = message.content
+            if isinstance(raw, bytes):
+                text = raw.decode("utf-8", errors="replace")
+            elif raw:
+                text = str(raw)
+        except:
+            pass
+    if not text:
+        try:
+            text = message.title_as_string() or ""
+        except:
+            pass
     ts = time.strftime("%H:%M:%S")
-    RNS.log(f"MSG RECEIVED from {sender}: {text}")
+    RNS.log(f"MSG RECEIVED from {sender}: '{text}' (fields={message.fields})")
     with _data_lock:
-        chat_messages.append({"from": sender, "text": text, "ts": ts, "direction": "in"})
+        chat_messages.append({"from": sender, "text": text or "(empty)", "ts": ts, "direction": "in"})
 
 def announce_received(destination_hash, announced_identity, app_data):
     # Always store with plain hex key (no <> brackets)
