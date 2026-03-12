@@ -61,18 +61,21 @@ def kiss_cmd(cmd, data=b""):
 
 def configure_rnode(socket):
     RNS.log("Configuring RNode radio parameters...")
-    socket.write(kiss_cmd(CMD_FREQUENCY, struct.pack(">I", 433025000)))
-    time.sleep(0.1)
-    socket.write(kiss_cmd(CMD_BANDWIDTH, struct.pack(">I", 31250)))
-    time.sleep(0.1)
-    socket.write(kiss_cmd(CMD_TXPOWER, bytes([17])))
-    time.sleep(0.1)
-    socket.write(kiss_cmd(CMD_SF, bytes([8])))
-    time.sleep(0.1)
-    socket.write(kiss_cmd(CMD_CR, bytes([6])))
-    time.sleep(0.1)
-    socket.write(kiss_cmd(CMD_RADIO_STATE, bytes([RADIO_STATE_ON])))
+    # Reset first to clear any stale config from previous session (e.g. Sideband)
+    socket.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x00])))  # radio OFF
     time.sleep(0.5)
+    socket.write(kiss_cmd(CMD_FREQUENCY, struct.pack(">I", 433025000)))
+    time.sleep(0.2)
+    socket.write(kiss_cmd(CMD_BANDWIDTH, struct.pack(">I", 31250)))
+    time.sleep(0.2)
+    socket.write(kiss_cmd(CMD_TXPOWER, bytes([17])))
+    time.sleep(0.2)
+    socket.write(kiss_cmd(CMD_SF, bytes([8])))
+    time.sleep(0.2)
+    socket.write(kiss_cmd(CMD_CR, bytes([6])))
+    time.sleep(0.2)
+    socket.write(kiss_cmd(CMD_RADIO_STATE, bytes([RADIO_STATE_ON])))
+    time.sleep(1.0)  # longer wait for radio to fully come up
     RNS.log("RNode radio configured and ON")
 
 class AndroidBTInterface(Interface):
@@ -164,7 +167,6 @@ def message_received(message):
 def announce_received(destination_hash, announced_identity, app_data):
     global known_identities
     hash_str = RNS.prettyhexrep(destination_hash).strip("<>")
-    RNS.log(f"DEBUG announce_received called: hash={hash_str} identity={announced_identity is not None} app_data={app_data}")
     name = ""
     if app_data:
         try:
@@ -263,9 +265,10 @@ def _rns_main(bt_socket_wrapper):
 def start(bt_socket_wrapper):
     global _rns_started
     if _rns_started:
+        _start_done.wait(timeout=30)
         if destination:
             return RNS.prettyhexrep(destination.hash)
-        return "Error: already started but no address"
+        return _start_result.get("error") or "Timeout"
     _rns_started = True
     _start_done.clear()
     _start_result["addr"] = None
