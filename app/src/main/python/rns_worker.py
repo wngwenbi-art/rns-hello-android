@@ -19,6 +19,12 @@ _start_result = {"addr": None, "error": None}
 chat_messages = []
 seen_announces = []
 known_identities = {}  # hash_hex -> RNS.Identity, populated from announces
+
+# Send queue — ensures half-duplex LoRa only sends one message at a time
+_send_queue = []                      # list of (dest_hash_hex, text, result_holder)
+_send_lock = threading.Lock()
+_send_event = threading.Event()       # signals queue worker there's work to do
+_current_send_done = threading.Event()  # signals current message finished
 contacts = {}  # hash_hex -> nickname string, persisted to disk
 
 CONTACTS_PATH = "/data/data/com.example.rnshello/files/contacts.json"
@@ -294,6 +300,9 @@ def _rns_main(bt_socket_wrapper):
         lxmf_router.register_delivery_callback(message_received)
         RNS.Transport.register_announce_handler(AnnounceHandler())
 
+        # Start the send queue worker
+        threading.Thread(target=_queue_worker, daemon=True).start()
+
         destination.announce()
 
         addr = RNS.prettyhexrep(destination.hash)
@@ -323,25 +332,19 @@ def start(bt_socket_wrapper):
         return f"Error: {_start_result['error']}"
     return _start_result["addr"] or "Timeout"
 
-def send_message(dest_hash_hex, text):
+def _do_send(dest_hash_hex, text):
+    """Actually send one message. Called only from queue worker thread."""
     global lxmf_router, destination, known_identities
-    if not lxmf_router or not destination:
-        return "Not connected"
     try:
-        dest_hash_hex = dest_hash_hex.strip()
         dest_hash = bytes.fromhex(dest_hash_hex)
-        RNS.log(f"Sending to {dest_hash_hex}: {text}")
+        RNS.log(f"[Queue] Sending to {dest_hash_hex}: {text[:40]}")
 
-        # Step 1: get identity - prefer from announce cache, fallback to recall
+        # Get identity
         recalled_identity = known_identities.get(dest_hash_hex)
         if recalled_identity is None:
             recalled_identity = RNS.Identity.recall(dest_hash)
-            RNS.log(f"Identity recall result: {recalled_identity}")
-        else:
-            RNS.log(f"Using cached identity for {dest_hash_hex}")
-
         if recalled_identity is None:
-            RNS.log("No identity known, requesting path and waiting...")
+            RNS.log("No identity, requesting path...")
             RNS.Transport.request_path(dest_hash)
             for i in range(15):
                 time.sleep(2)
@@ -353,9 +356,8 @@ def send_message(dest_hash_hex, text):
                     break
 
         if recalled_identity is None:
-            return "No identity known for destination. Have they announced recently?"
+            return "No identity known. Have they announced recently?"
 
-        # Step 2: build LXMF destination
         lxmf_dest = RNS.Destination(
             recalled_identity,
             RNS.Destination.OUT,
@@ -363,34 +365,32 @@ def send_message(dest_hash_hex, text):
             "lxmf",
             "delivery"
         )
-        RNS.log(f"LXMF dest hash: {RNS.prettyhexrep(lxmf_dest.hash)}")
 
-        # Step 3: send — DIRECT if path known, else PROPAGATED fallback
         method = LXMF.LXMessage.DIRECT
-        if not RNS.Transport.has_path(lxmf_dest.hash):
-            RNS.log("No path, will try DIRECT anyway (single-hop LoRa)")
-
-        # For image payloads, send as raw bytes to avoid encoding issues
         if text.startswith("IMG:"):
-            msg_content = text.encode("utf-8")
-            msg = LXMF.LXMessage(
-                lxmf_dest,
-                destination,
-                msg_content,
-                title="",
-                desired_method=method
-            )
+            msg = LXMF.LXMessage(lxmf_dest, destination, text.encode("utf-8"), title="", desired_method=method)
         else:
-            msg = LXMF.LXMessage(
-                lxmf_dest,
-                destination,
-                text,
-                title="",
-                desired_method=method
-            )
-        msg.register_delivery_callback(lambda m: RNS.log(f"Delivered! state={m.state}"))
-        msg.register_failed_callback(lambda m: RNS.log(f"Failed! state={m.state}"))
+            msg = LXMF.LXMessage(lxmf_dest, destination, text, title="", desired_method=method)
+
+        # Signal done when delivered OR failed so queue can proceed
+        def on_delivered(m):
+            RNS.log(f"[Queue] Delivered! state={m.state}")
+            _current_send_done.set()
+
+        def on_failed(m):
+            RNS.log(f"[Queue] Failed! state={m.state}")
+            _current_send_done.set()
+
+        msg.register_delivery_callback(on_delivered)
+        msg.register_failed_callback(on_failed)
+
+        _current_send_done.clear()
         lxmf_router.handle_outbound(msg)
+
+        # Wait up to 120s for delivery/failure before allowing next send
+        delivered = _current_send_done.wait(timeout=120)
+        if not delivered:
+            RNS.log("[Queue] Timed out waiting for delivery confirmation")
 
         ts = time.strftime("%H:%M:%S")
         chat_messages.append({"from": "me", "to": dest_hash_hex, "text": text, "ts": ts, "direction": "out"})
@@ -398,9 +398,40 @@ def send_message(dest_hash_hex, text):
 
     except Exception as e:
         import traceback
-        err = traceback.format_exc()
-        RNS.log(f"send_message error: {err}")
+        RNS.log(f"[Queue] send error: {traceback.format_exc()}")
+        _current_send_done.set()  # unblock queue on error
         return f"Error: {e}"
+
+
+def _queue_worker():
+    """Single worker thread — processes one outbound message at a time."""
+    while True:
+        _send_event.wait()
+        _send_event.clear()
+        while True:
+            with _send_lock:
+                if not _send_queue:
+                    break
+                dest, text, holder = _send_queue.pop(0)
+            result = _do_send(dest, text)
+            holder["result"] = result
+            holder["done"].set()
+
+
+def send_message(dest_hash_hex, text):
+    if not lxmf_router or not destination:
+        return "Not connected"
+    dest_hash_hex = dest_hash_hex.strip()
+    holder = {"result": None, "done": threading.Event()}
+    with _send_lock:
+        _send_queue.append((dest_hash_hex, text, holder))
+    queue_pos = len(_send_queue)
+    _send_event.set()
+    if queue_pos > 1:
+        RNS.log(f"[Queue] Message queued at position {queue_pos}")
+    # Wait for this message's turn and completion (max 180s total)
+    holder["done"].wait(timeout=180)
+    return holder["result"] or "Timeout"
 
 def get_messages():
     result = []
