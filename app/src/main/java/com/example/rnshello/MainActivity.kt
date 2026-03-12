@@ -524,8 +524,8 @@ class MainActivity : AppCompatActivity() {
         val input = EditText(this).apply {
             setText(currentNickname)
             hint = "e.g. Alice's RNode"
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
+            setTextColor(Color.parseColor("#1a1a2e"))      // dark text on white dialog background
+            setHintTextColor(Color.parseColor("#999999"))  // mid-grey hint, still readable
             setSingleLine(true)
         }
         layout.addView(input)
