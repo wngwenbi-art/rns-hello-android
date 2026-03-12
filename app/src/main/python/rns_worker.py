@@ -215,23 +215,32 @@ def message_received(message):
     sender = RNS.prettyhexrep(message.source_hash)
     ts = time.strftime("%H:%M:%S")
 
-    # Check for image/file attachment field first (LXMF standard)
+    # Check for image fields first (LXMF standard)
     text = ""
     try:
         fields = message.fields
-        if fields and LXMF.FIELD_FILE_ATTACHMENTS in fields:
-            attachments = fields[LXMF.FIELD_FILE_ATTACHMENTS]
-            if attachments:
-                fname, fdata = attachments[0][0], attachments[0][1]
-                fname_lower = str(fname).lower()
-                if any(fname_lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
-                    import base64
-                    b64 = base64.b64encode(fdata).decode("ascii")
+        if fields:
+            import base64 as _b64
+            # FIELD_IMAGE (0x06) — ["jpeg"/"webp"/"png", bytes]
+            if LXMF.FIELD_IMAGE in fields:
+                img_field = fields[LXMF.FIELD_IMAGE]
+                if isinstance(img_field, (list, tuple)) and len(img_field) >= 2:
+                    fdata = img_field[1]
+                    b64 = _b64.b64encode(fdata).decode("ascii")
                     text = f"IMG:{b64}"
-                    RNS.log(f"MSG RECEIVED image from {sender}, size={len(fdata)}B")
-                else:
-                    text = f"[File: {fname}]"
-                    RNS.log(f"MSG RECEIVED file from {sender}: {fname}")
+                    RNS.log(f"MSG RECEIVED image (FIELD_IMAGE) from {sender}, size={len(fdata)}B")
+            # FIELD_FILE_ATTACHMENTS (0x05) fallback
+            elif LXMF.FIELD_FILE_ATTACHMENTS in fields:
+                attachments = fields[LXMF.FIELD_FILE_ATTACHMENTS]
+                if attachments:
+                    fname, fdata = attachments[0][0], attachments[0][1]
+                    fname_lower = str(fname).lower()
+                    if any(fname_lower.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
+                        b64 = _b64.b64encode(fdata).decode("ascii")
+                        text = f"IMG:{b64}"
+                        RNS.log(f"MSG RECEIVED image (FIELD_FILE_ATTACHMENTS) from {sender}, size={len(fdata)}B")
+                    else:
+                        text = f"[File: {fname}]"
     except Exception as e:
         RNS.log(f"Field decode error: {e}")
 
@@ -442,16 +451,20 @@ def _do_send(dest_hash_hex, text):
 
         method = LXMF.LXMessage.DIRECT
         if text.startswith("IMG:"):
-            # Use LXMF standard FIELD_FILE_ATTACHMENTS so Sideband displays natively
             import base64 as _b64
             img_bytes = _b64.b64decode(text[4:])
-            attachment = ["photo.jpg", img_bytes]
-            lxm_fields = {LXMF.FIELD_FILE_ATTACHMENTS: [attachment]}
+            # Use both FIELD_IMAGE (0x06) and FIELD_FILE_ATTACHMENTS (0x05)
+            # FIELD_IMAGE is the native Sideband image field
+            # FIELD_FILE_ATTACHMENTS is the fallback for other clients
+            lxm_fields = {
+                LXMF.FIELD_IMAGE: ["jpeg", img_bytes],
+                LXMF.FIELD_FILE_ATTACHMENTS: [["photo.jpg", img_bytes]]
+            }
             msg = LXMF.LXMessage(
                 lxmf_dest, destination, "",
                 title="", desired_method=method, fields=lxm_fields
             )
-            RNS.log(f"Sending image as FIELD_FILE_ATTACHMENTS, size={len(img_bytes)}B")
+            RNS.log(f"Sending image via FIELD_IMAGE+FIELD_FILE_ATTACHMENTS, size={len(img_bytes)}B")
         else:
             msg = LXMF.LXMessage(lxmf_dest, destination, text, title="", desired_method=method)
 
