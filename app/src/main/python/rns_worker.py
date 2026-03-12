@@ -23,7 +23,7 @@ known_identities = {}  # hash_hex -> RNS.Identity, populated from announces
 RNS_CONFIG = """
 [reticulum]
   enable_transport = True
-  share_instance = False
+  share_instance = True
   shared_instance_port = 37428
   instance_control_port = 37429
   panic_on_interface_error = False
@@ -61,6 +61,8 @@ def kiss_cmd(cmd, data=b""):
 
 def configure_rnode(socket):
     RNS.log("Configuring RNode radio parameters...")
+    socket.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x00])))
+    time.sleep(0.5)
     socket.write(kiss_cmd(CMD_FREQUENCY, struct.pack(">I", 433025000)))
     time.sleep(0.1)
     socket.write(kiss_cmd(CMD_BANDWIDTH, struct.pack(">I", 31250)))
@@ -107,13 +109,11 @@ class AndroidBTInterface(Interface):
         self.ifac_key               = None
         self.ifac_identity          = None
         self.ifac_signature         = None
-        # Announce rate limiting — accessed by Transport.inbound()
         self.announce_rate_target   = None
         self.announce_rate_grace    = None
         self.announce_rate_penalty  = None
         self.announce_allowed_at    = 0.0
         self.announce_time          = None
-        # Stamp / cost
         self.stamp_cost             = None
         self.online                 = True
         self._kiss_buf              = []
@@ -135,10 +135,14 @@ class AndroidBTInterface(Interface):
         for byte in data:
             if byte == KISS_FEND:
                 if self._in_frame and len(self._kiss_buf) > 1:
-                    if self._kiss_buf[0] == CMD_DATA:
-                        pkt = bytes(self._kiss_buf[1:])
+                    pkt = bytes(self._kiss_buf[1:])
+                    if len(pkt) > 0:
                         self.rxb += len(pkt)
-                        self.owner.inbound(pkt, self)
+                        RNS.log(f"RX KISS port=0x{self._kiss_buf[0]:02x} len={len(pkt)}")
+                        try:
+                            self.owner.inbound(pkt, self)
+                        except Exception as e:
+                            RNS.log(f"inbound error: {e}")
                 self._kiss_buf = []
                 self._in_frame = True
                 self._escape   = False
@@ -213,19 +217,31 @@ def _rns_main(bt_socket_wrapper):
         original_signal = signal.signal
         signal.signal = _noop_signal
 
+        iface = AndroidBTInterface(RNS.Transport, "RNodeBT", bt_socket_wrapper)
+        RNS.Transport.interfaces.append(iface)
         reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
 
-        iface = AndroidBTInterface(RNS.Transport, "RNodeBT", bt_socket_wrapper)
-        RNS.Transport.register_interface(iface)
-
-        identity_path = "/data/data/com.example.rnshello/files/identity"
+        files_dir = "/data/data/com.example.rnshello/files"
+        os.makedirs(files_dir, exist_ok=True)
+        identity_path = os.path.join(files_dir, "identity")
+        identity = None
         if os.path.exists(identity_path):
-            identity = RNS.Identity.from_file(identity_path)
-            RNS.log("Loaded existing identity")
-        else:
+            try:
+                identity = RNS.Identity.from_file(identity_path)
+                if identity is not None:
+                    RNS.log(f"Loaded existing identity: {RNS.prettyhexrep(identity.hash)}")
+                else:
+                    RNS.log("Identity file corrupt, recreating")
+            except Exception as ie:
+                RNS.log(f"Identity load error: {ie}, recreating")
+                identity = None
+        if identity is None:
             identity = RNS.Identity()
-            identity.to_file(identity_path)
-            RNS.log("Created new identity")
+            try:
+                identity.to_file(identity_path)
+                RNS.log(f"Saved new identity: {RNS.prettyhexrep(identity.hash)}")
+            except Exception as se:
+                RNS.log(f"Identity save error: {se}")
 
         lxmf_router = LXMF.LXMRouter(
             storagepath="/data/data/com.example.rnshello/files/lxmf",
@@ -238,6 +254,7 @@ def _rns_main(bt_socket_wrapper):
             identity,
             display_name="RNS Hello Android"
         )
+        destination.set_proof_strategy(RNS.Destination.PROVE_ALL)
         lxmf_router.register_delivery_callback(message_received)
         RNS.Transport.register_announce_handler(AnnounceHandler())
 
@@ -276,7 +293,7 @@ def send_message(dest_hash_hex, text):
         return "Not connected"
     try:
         dest_hash_hex = dest_hash_hex.strip()
-        dest_hash = bytes.fromhex(dest_hash_hex)
+        dest_hash = bytes.fromhex(dest_hash_hex.strip().strip('<>'))
         RNS.log(f"Sending to {dest_hash_hex}: {text}")
 
         # Step 1: get identity - prefer from announce cache, fallback to recall
@@ -313,7 +330,7 @@ def send_message(dest_hash_hex, text):
         RNS.log(f"LXMF dest hash: {RNS.prettyhexrep(lxmf_dest.hash)}")
 
         # Step 3: send — DIRECT if path known, else PROPAGATED fallback
-        method = LXMF.LXMessage.DIRECT
+        method = LXMF.LXMessage.OPPORTUNISTIC
         if not RNS.Transport.has_path(lxmf_dest.hash):
             RNS.log("No path, will try DIRECT anyway (single-hop LoRa)")
 
