@@ -34,6 +34,10 @@ object RNSBridge {
         return result
     }
 
+    fun announce(): String {
+        return worker.callAttr("announce").toString()
+    }
+
     fun getAnnounces(): List<Map<String, String>> {
         val raw = worker.callAttr("get_announces")
         val result = mutableListOf<Map<String, String>>()
@@ -45,19 +49,5 @@ object RNSBridge {
             result.add(map)
         }
         return result
-    }
-
-    fun setContact(hashHex: String, name: String): String {
-        return try {
-            worker.callAttr("set_contact", hashHex, name).toString()
-        } catch (e: Exception) {
-            "Error: ${e.message}"
-        }
-    }
-
-    fun getContact(hashHex: String): String {
-        return try {
-            worker.callAttr("get_contact", hashHex).toString()
-        } catch (e: Exception) { "" }
     }
 }

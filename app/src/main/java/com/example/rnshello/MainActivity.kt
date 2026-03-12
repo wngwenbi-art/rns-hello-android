@@ -16,15 +16,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
-import android.app.Activity
-import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.provider.MediaStore
-import android.util.Base64
-import android.widget.ImageView
 import kotlinx.coroutines.*
-import java.io.ByteArrayOutputStream
 
 class MainActivity : AppCompatActivity() {
 
@@ -47,11 +39,6 @@ class MainActivity : AppCompatActivity() {
     private var lastMessageCount = 0
     private var lastAnnounceCount = 0
     private val btService = BluetoothService()
-    private lateinit var btnCamera: Button
-    private val REQUEST_IMAGE_CAPTURE = 1001
-    private var currentChatHash: String = ""   // empty = show all
-    private lateinit var tvChatWith: TextView
-    private lateinit var btnClearFilter: Button
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -72,50 +59,6 @@ class MainActivity : AppCompatActivity() {
         etMessage          = findViewById(R.id.etMessage)
         btnSend            = findViewById(R.id.btnSend)
 
-        // Camera button — added programmatically next to Send
-        btnCamera = Button(this).apply {
-            text = "Cam"
-            setBackgroundColor(Color.parseColor("#0f3460"))
-            setTextColor(Color.parseColor("#00d4ff"))
-        }
-
-        // "Chatting with" banner — added programmatically above chat scroll
-        tvChatWith = TextView(this).apply {
-            text = "All messages"
-            textSize = 12f
-            setTextColor(Color.parseColor("#00d4ff"))
-            setPadding(16, 8, 8, 8)
-            visibility = View.VISIBLE
-        }
-        btnClearFilter = Button(this).apply {
-            text = "X"
-            textSize = 10f
-            setPadding(16, 4, 16, 4)
-            setBackgroundColor(Color.parseColor("#1a1a2e"))
-            setTextColor(Color.GRAY)
-        }
-        // Insert banner row above scrollChat
-        (scrollChat.parent as? LinearLayout)?.let { parent ->
-            val idx = parent.indexOfChild(scrollChat)
-            val row = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-            }
-            row.addView(tvChatWith, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            row.addView(btnClearFilter)
-            parent.addView(row, idx)
-        }
-        btnClearFilter.setOnClickListener {
-            currentChatHash = ""
-            tvChatWith.text = "All messages"
-            etDestHash.setText("")
-            lastMessageCount = -1
-            refreshMessages()
-        }
-
         if (!Python.isStarted()) {
             Python.start(AndroidPlatform(this))
         }
@@ -135,26 +78,22 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Insert camera button into the same row as Send button
-        (btnSend.parent as? android.view.ViewGroup)?.let { parent ->
-            val params = android.widget.LinearLayout.LayoutParams(
-                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
-                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
-            ).also { it.setMargins(8, 0, 0, 0) }
-            btnCamera.layoutParams = params
-            parent.addView(btnCamera)
+        val btnAnnounce = Button(this).apply {
+            text = "📡 Announce"
+            setTextColor(Color.parseColor("#1a1a2e"))
+            backgroundTintList = android.content.res.ColorStateList.valueOf(Color.parseColor("#00d4ff"))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.setMargins(8, 8, 8, 8) }
         }
-
-        btnCamera.setOnClickListener {
-            val dest = etDestHash.text.toString().trim()
-            if (dest.isEmpty()) { toast("Enter a destination address first"); return@setOnClickListener }
-            val takePicture = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
-            if (takePicture.resolveActivity(packageManager) != null) {
-                startActivityForResult(takePicture, REQUEST_IMAGE_CAPTURE)
-            } else {
-                toast("No camera app found")
+        btnAnnounce.setOnClickListener {
+            scope.launch(Dispatchers.IO) {
+                val result = try { RNSBridge.announce() } catch (e: Exception) { "Error: ${e.message}" }
+                withContext(Dispatchers.Main) { toast(result) }
             }
         }
+        (btnTabAnnounces.parent as? android.view.ViewGroup)?.addView(btnAnnounce)
 
         requestPermissions()
     }
@@ -192,26 +131,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshMessages() {
-        val allMessages = try { RNSBridge.getMessages() } catch (e: Exception) { return }
-        // Filter to current contact if one is selected
-        val messages = if (currentChatHash.isEmpty()) allMessages
-        else allMessages.filter { msg ->
-            val fromHash = (msg["from"] ?: "").replace("<","").replace(">","")
-            val toHash   = (msg["to"]   ?: "").replace("<","").replace(">","")
-            fromHash == currentChatHash || toHash == currentChatHash ||
-            (msg["direction"] == "out" && etDestHash.text.toString().trim() == currentChatHash)
-        }
+        val messages = try { RNSBridge.getMessages() } catch (e: Exception) { return }
         if (messages.size == lastMessageCount) return
         lastMessageCount = messages.size
         runOnUiThread {
             chatContainer.removeAllViews()
             for (msg in messages) {
                 addChatBubble(
-                    msg["display_from"] ?: msg["from"] ?: "",
+                    msg["from"] ?: "",
                     msg["text"] ?: "",
                     msg["ts"] ?: "",
-                    msg["direction"] == "out",
-                    (msg["from"] ?: "").replace("<", "").replace(">", "")
+                    msg["direction"] == "out"
                 )
             }
             scrollChat.post { scrollChat.fullScroll(View.FOCUS_DOWN) }
@@ -225,12 +155,12 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread {
             announcesContainer.removeAllViews()
             for (ann in announces.reversed()) {
-                addAnnounceCard(ann["hash"] ?: "", ann["display"] ?: ann["name"] ?: "", ann["ts"] ?: "")
+                addAnnounceCard(ann["hash"] ?: "", ann["name"] ?: "", ann["ts"] ?: "")
             }
         }
     }
 
-    private fun addChatBubble(from: String, text: String, ts: String, isOutgoing: Boolean, rawHash: String = "") {
+    private fun addChatBubble(from: String, text: String, ts: String, isOutgoing: Boolean) {
         val wrapper = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(
@@ -241,70 +171,25 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (!isOutgoing) {
-            val senderLabel = TextView(this).apply {
+            wrapper.addView(TextView(this).apply {
                 this.text = from
                 textSize = 9f
                 setTextColor(Color.parseColor("#00d4ff"))
                 typeface = android.graphics.Typeface.MONOSPACE
-            }
-            if (rawHash.isNotEmpty()) {
-                senderLabel.setOnLongClickListener {
-                    val input = android.widget.EditText(this)
-                    input.setText(RNSBridge.getContact(rawHash))
-                    input.hint = "Enter nickname (blank to clear)"
-                    androidx.appcompat.app.AlertDialog.Builder(this)
-                        .setTitle("Set nickname")
-                        .setMessage(rawHash)
-                        .setView(input)
-                        .setPositiveButton("Save") { _, _ ->
-                            val nick = input.text.toString()
-                            RNSBridge.setContact(rawHash, nick)
-                            senderLabel.text = if (nick.isBlank()) rawHash else nick
-                            toast(if (nick.isBlank()) "Nickname cleared" else "Saved: $nick")
-                            lastMessageCount = 0  // force chat refresh
-                        }
-                        .setNegativeButton("Cancel", null)
-                        .show()
-                    true
-                }
-            }
-            wrapper.addView(senderLabel)
-        }
-
-        val trimmedText = text.trim().trimStart('\u0000')
-        android.util.Log.d("ChatBubble", "text starts with: ${trimmedText.take(20)}, isImg=${trimmedText.startsWith("IMG:")}")
-        if (trimmedText.startsWith("IMG:")) {
-            try {
-                val b64 = trimmedText.removePrefix("IMG:")
-                val bytes = Base64.decode(b64, Base64.NO_WRAP)
-                val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                wrapper.addView(ImageView(this).apply {
-                    setImageBitmap(bmp)
-                    adjustViewBounds = true
-                    layoutParams = LinearLayout.LayoutParams(300, LinearLayout.LayoutParams.WRAP_CONTENT)
-                        .also { lp -> lp.gravity = if (isOutgoing) Gravity.END else Gravity.START }
-                    setPadding(4, 4, 4, 4)
-                })
-            } catch (e: Exception) {
-                wrapper.addView(TextView(this).apply {
-                    this.text = "[Photo - decode error]"
-                    textSize = 12f
-                    setTextColor(Color.GRAY)
-                })
-            }
-        } else {
-            wrapper.addView(TextView(this).apply {
-                this.text = trimmedText
-                textSize = 14f
-                setTextColor(Color.WHITE)
-                setPadding(16, 10, 16, 10)
-                setBackgroundColor(if (isOutgoing) Color.parseColor("#0f3460") else Color.parseColor("#1a3a1a"))
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).also { lp -> lp.gravity = if (isOutgoing) Gravity.END else Gravity.START }
             })
         }
+
+        wrapper.addView(TextView(this).apply {
+            this.text = text
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            setPadding(16, 10, 16, 10)
+            setBackgroundColor(if (isOutgoing) Color.parseColor("#0f3460") else Color.parseColor("#1a3a1a"))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { lp -> lp.gravity = if (isOutgoing) Gravity.END else Gravity.START }
+        })
 
         wrapper.addView(TextView(this).apply {
             this.text = ts
@@ -347,32 +232,9 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.GRAY)
         })
         card.setOnClickListener {
-            currentChatHash = cleanHash
             etDestHash.setText(cleanHash)
-            val displayName = if (name.isNotEmpty()) name else cleanHash.take(12) + "..."
-            tvChatWith.text = "Chatting with: $displayName"
-            lastMessageCount = -1  // force refresh with new filter
             showTab("chat")
-        }
-        card.setOnLongClickListener {
-            val input = android.widget.EditText(this)
-            val currentName = RNSBridge.getContact(cleanHash)
-            input.setText(currentName)
-            input.hint = "Enter nickname (blank to clear)"
-            androidx.appcompat.app.AlertDialog.Builder(this)
-                .setTitle("Set nickname")
-                .setMessage(cleanHash)
-                .setView(input)
-                .setPositiveButton("Save") { _, _ ->
-                    val nick = input.text.toString()
-                    RNSBridge.setContact(cleanHash, nick)
-                    toast(if (nick.isBlank()) "Nickname cleared" else "Saved: $nick")
-                    lastAnnounceCount = 0  // force UI refresh
-                    refreshAnnounces()
-                }
-                .setNegativeButton("Cancel", null)
-                .show()
-            true
+            toast("Address copied - type a message and tap Send")
         }
         announcesContainer.addView(card)
     }
@@ -442,61 +304,10 @@ class MainActivity : AppCompatActivity() {
                     toast("RNS error: $addr")
                     btnConnect.isEnabled = true
                 } else {
-                    val myAddr = addr
-                    tvMyAddress.text = "My address: $myAddr"
-                    tvMyAddress.setOnLongClickListener {
-                        val input = android.widget.EditText(this@MainActivity)
-                        input.setText(RNSBridge.getContact(myAddr))
-                        input.hint = "Enter nickname for your address"
-                        androidx.appcompat.app.AlertDialog.Builder(this@MainActivity)
-                            .setTitle("Set my address nickname")
-                            .setMessage(myAddr)
-                            .setView(input)
-                            .setPositiveButton("Save") { _, _ ->
-                                val nick = input.text.toString()
-                                RNSBridge.setContact(myAddr, nick)
-                                tvMyAddress.text = if (nick.isBlank()) "My address: $myAddr"
-                                                   else "My address: $nick"
-                                toast(if (nick.isBlank()) "Nickname cleared" else "Saved: $nick")
-                            }
-                            .setNegativeButton("Cancel", null)
-                            .show()
-                        true
-                    }
+                    tvMyAddress.text = "My address: $addr"
                     toast("Ready!")
                     startPolling()
                 }
-            }
-        }
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQUEST_IMAGE_CAPTURE && resultCode == Activity.RESULT_OK) {
-            val thumbnail = data?.extras?.get("data") as? Bitmap ?: return
-            val dest = etDestHash.text.toString().trim()
-
-            // Resize aggressively for LoRa — target <1KB final payload
-            // Try progressively smaller sizes until under 800 bytes
-            var baos = ByteArrayOutputStream()
-            var b64 = ""
-            for (maxW in listOf(80, 60, 48, 32)) {
-                val scale = maxW.toFloat() / thumbnail.width.coerceAtLeast(1)
-                val w = maxW
-                val h = (thumbnail.height * scale).toInt().coerceAtLeast(1)
-                val small = Bitmap.createScaledBitmap(thumbnail, w, h, true)
-                baos = ByteArrayOutputStream()
-                small.compress(Bitmap.CompressFormat.JPEG, 15, baos)
-                b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-                if (b64.length < 1200) break  // ~900 bytes raw = ~1200 b64
-            }
-            val payload = "IMG:$b64"
-            val sizeBytes = baos.size()
-            toast("Sending photo (${sizeBytes}B, b64=${b64.length} chars)...")
-
-            scope.launch(Dispatchers.IO) {
-                val result = RNSBridge.sendMessage(dest, payload)
-                withContext(Dispatchers.Main) { toast(result) }
             }
         }
     }
