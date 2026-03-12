@@ -32,9 +32,30 @@ object RNSBridge {
     fun getAnnounces(): List<Map<String, String>> =
         worker.callAttr("get_announces").toStringMapList()
 
+    // ── Contacts ──────────────────────────────────────────────────────────────
+
+    /** Save or update a contact name for a given hash. */
+    fun saveContact(hashHex: String, name: String): String =
+        worker.callAttr("save_contact", hashHex, name).toString()
+
+    /** Delete a contact by hash. */
+    fun deleteContact(hashHex: String): String =
+        worker.callAttr("delete_contact", hashHex).toString()
+
+    /** Return all saved contacts as [{hash, name}] */
+    fun getContacts(): List<Map<String, String>> =
+        worker.callAttr("get_contacts").toStringMapList()
+
+    /**
+     * Resolve a hash to a friendly name at the UI layer only.
+     * RNS operations always use the raw hash — never this.
+     * [fallback] is typically the RNS announce display name.
+     */
+    fun resolveName(hashHex: String, fallback: String = ""): String =
+        worker.callAttr("resolve_name", hashHex, fallback).toString()
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /** Converts a Python list-of-dicts into a Kotlin List<Map<String, String>>. */
     private fun PyObject.toStringMapList(): List<Map<String, String>> =
         asList().map { item ->
             item.asMap().entries.associate { (k, v) -> k.toString() to v.toString() }

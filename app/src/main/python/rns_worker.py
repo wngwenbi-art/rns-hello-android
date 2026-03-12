@@ -557,3 +557,28 @@ def get_address():
     if destination:
         return RNS.prettyhexrep(destination.hash).strip("<>")
     return "Not initialized"
+
+# ── Contacts — thin delegation to contacts.py ─────────────────────────────────
+# RNS layer never uses these. Only the UI layer calls them via RNSBridge.
+
+import contacts as _contacts_mod
+
+def save_contact(hash_hex: str, name: str) -> str:
+    try:
+        _contacts_mod.save(hash_hex, name)
+        return "OK"
+    except Exception as e:
+        return f"Error: {e}"
+
+def delete_contact(hash_hex: str) -> str:
+    try:
+        _contacts_mod.delete(hash_hex)
+        return "OK"
+    except Exception as e:
+        return f"Error: {e}"
+
+def get_contacts() -> list:
+    return _contacts_mod.get_all()
+
+def resolve_name(hash_hex: str, fallback: str = "") -> str:
+    return _contacts_mod.resolve(hash_hex, fallback)
