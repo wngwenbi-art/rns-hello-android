@@ -4,50 +4,39 @@ import com.chaquo.python.PyObject
 import com.chaquo.python.Python
 
 object RNSBridge {
-    private val py = Python.getInstance()
+
+    private val py     = Python.getInstance()
     private val worker get() = py.getModule("rns_worker")
 
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
     fun start(btService: BluetoothService): String {
-        // Wrap the Kotlin BluetoothService as a Python-callable object
         val pyBtWrapper = py.getModule("bt_wrapper").callAttr("BtWrapper", btService)
         return worker.callAttr("start", pyBtWrapper).toString()
     }
 
-    fun sendMessage(destHashHex: String, text: String): String {
-        return worker.callAttr("send_message", destHashHex, text).toString()
-    }
+    fun announce(): String =
+        worker.callAttr("announce").toString()
 
-    fun getAddress(): String {
-        return worker.callAttr("get_address").toString()
-    }
+    fun getAddress(): String =
+        worker.callAttr("get_address").toString()
 
-    fun getMessages(): List<Map<String, String>> {
-        val raw = worker.callAttr("get_messages")
-        val result = mutableListOf<Map<String, String>>()
-        for (item in raw.asList()) {
-            val map = mutableMapOf<String, String>()
-            for ((k, v) in item.asMap()) {
-                map[k.toString()] = v.toString()
-            }
-            result.add(map)
+    // ── Messaging ─────────────────────────────────────────────────────────────
+
+    fun sendMessage(destHashHex: String, text: String): String =
+        worker.callAttr("send_message", destHashHex, text).toString()
+
+    fun getMessages(): List<Map<String, String>> =
+        worker.callAttr("get_messages").toStringMapList()
+
+    fun getAnnounces(): List<Map<String, String>> =
+        worker.callAttr("get_announces").toStringMapList()
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /** Converts a Python list-of-dicts into a Kotlin List<Map<String, String>>. */
+    private fun PyObject.toStringMapList(): List<Map<String, String>> =
+        asList().map { item ->
+            item.asMap().entries.associate { (k, v) -> k.toString() to v.toString() }
         }
-        return result
-    }
-
-    fun announce(): String {
-        return worker.callAttr("announce").toString()
-    }
-
-    fun getAnnounces(): List<Map<String, String>> {
-        val raw = worker.callAttr("get_announces")
-        val result = mutableListOf<Map<String, String>>()
-        for (item in raw.asList()) {
-            val map = mutableMapOf<String, String>()
-            for ((k, v) in item.asMap()) {
-                map[k.toString()] = v.toString()
-            }
-            result.add(map)
-        }
-        return result
-    }
 }

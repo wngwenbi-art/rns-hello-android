@@ -142,19 +142,40 @@
     </LinearLayout>
 
     <!-- Announces panel -->
-    <ScrollView
+    <LinearLayout
         android:id="@+id/panelAnnounces"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:visibility="gone"
-        android:padding="8dp">
+        android:orientation="vertical"
+        android:visibility="gone">
 
-        <LinearLayout
-            android:id="@+id/announcesContainer"
+        <!-- Announce button — full width, declared in XML -->
+        <Button
+            android:id="@+id/btnAnnounce"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="vertical"/>
-    </ScrollView>
+            android:layout_marginStart="16dp"
+            android:layout_marginEnd="16dp"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="4dp"
+            android:text="📡 Announce"
+            android:backgroundTint="#00d4ff"
+            android:textColor="#1a1a2e"/>
+
+        <ScrollView
+            android:id="@+id/panelAnnouncesScroll"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:padding="8dp">
+
+            <LinearLayout
+                android:id="@+id/announcesContainer"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"/>
+        </ScrollView>
+    </LinearLayout>
 
 </LinearLayout>
