@@ -163,7 +163,7 @@ def message_received(message):
 
 def announce_received(destination_hash, announced_identity, app_data):
     global known_identities
-    hash_str = RNS.prettyhexrep(destination_hash)
+    hash_str = RNS.prettyhexrep(destination_hash).strip("<>")
     name = ""
     if app_data:
         try:
@@ -293,19 +293,9 @@ def send_message(dest_hash_hex, text):
             RNS.log(f"Using cached identity for {dest_hash_hex}")
 
         if recalled_identity is None:
-            RNS.log("No identity known, requesting path and waiting...")
+            RNS.log("No identity known, requesting path...")
             RNS.Transport.request_path(dest_hash)
-            for i in range(15):
-                time.sleep(2)
-                recalled_identity = known_identities.get(dest_hash_hex)
-                if recalled_identity is None:
-                    recalled_identity = RNS.Identity.recall(dest_hash)
-                if recalled_identity is not None:
-                    RNS.log(f"Got identity after {(i+1)*2}s")
-                    break
-
-        if recalled_identity is None:
-            return "No identity known for destination. Have they announced recently?"
+            return "Unknown destination — ask them to tap Announce first"
 
         # Step 2: build LXMF destination
         lxmf_dest = RNS.Destination(
@@ -358,7 +348,7 @@ def announce():
     try:
         if destination:
             destination.announce()
-            addr = RNS.prettyhexrep(destination.hash)
+            addr = RNS.prettyhexrep(destination.hash).strip("<>")
             RNS.log(f"Manual announce sent: {addr}")
             return f"Announced! {addr}"
         return "Not ready yet"
