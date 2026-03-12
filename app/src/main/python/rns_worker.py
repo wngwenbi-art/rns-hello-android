@@ -17,7 +17,7 @@ _start_result = {"addr": None, "error": None}
 
 # Thread-safe shared state
 _data_lock    = threading.Lock()
-chat_messages = []
+chat_messages = deque(maxlen=500)   # FIX: was unbounded list, now capped
 seen_announces = []
 known_identities = {}  # plain hex (no <>) -> RNS.Identity
 
@@ -207,17 +207,45 @@ def message_received(message):
     with _data_lock:
         chat_messages.append({"from": sender, "text": text or "(empty)", "ts": ts, "direction": "in"})
 
+def _decode_lxmf_app_data(app_data):
+    """
+    LXMF announce app_data is msgpack-encoded as [name_bytes, None].
+    Sideband example: b'\\x92\\xc4\\x0eAnonymous Peer\\xc0'
+      \\x92       = fixarray len 2
+      \\xc4\\x0e  = bin8, 14 bytes
+      ...name...
+      \\xc0       = nil
+    We try msgpack first, fall back to plain UTF-8.
+    """
+    if not app_data:
+        return ""
+    # Try msgpack decode
+    try:
+        import msgpack
+        decoded = msgpack.unpackb(app_data, raw=True)
+        if isinstance(decoded, (list, tuple)) and len(decoded) >= 1:
+            name_part = decoded[0]
+            if isinstance(name_part, bytes):
+                return name_part.decode("utf-8", errors="replace")
+            elif name_part is not None:
+                return str(name_part)
+    except Exception:
+        pass
+    # Fall back to plain UTF-8
+    try:
+        return app_data.decode("utf-8", errors="replace")
+    except Exception:
+        return str(app_data)
+
 def announce_received(destination_hash, announced_identity, app_data):
     # Always store with plain hex key (no <> brackets)
     hash_str = RNS.prettyhexrep(destination_hash).strip("<>")
-    name = ""
-    if app_data:
-        try:
-            name = app_data.decode("utf-8")
-        except:
-            name = str(app_data)
+
+    # FIX: use msgpack-aware decoder to match Sideband's format
+    name = _decode_lxmf_app_data(app_data)
+
     ts = time.strftime("%H:%M:%S")
-    RNS.log(f"ANNOUNCE from {hash_str} name={name}")
+    RNS.log(f"ANNOUNCE from {hash_str} name={name!r}")
     if announced_identity is not None:
         with _data_lock:
             known_identities[hash_str] = announced_identity
@@ -234,13 +262,50 @@ class AnnounceHandler:
     aspect_filter = "lxmf.delivery"
 
     def received_announce(self, destination_hash, announced_identity, app_data):
+        RNS.log(f"*** ANNOUNCE HANDLER FIRED: {RNS.prettyhexrep(destination_hash)}")
         announce_received(destination_hash, announced_identity, app_data)
+
+class RawAnnounceHandler:
+    """Catches ALL announces regardless of aspect — for debugging"""
+    aspect_filter = None
+
+    def received_announce(self, destination_hash, announced_identity, app_data):
+        RNS.log(f"*** RAW ANNOUNCE: {RNS.prettyhexrep(destination_hash)} app_data={app_data}")
 
 def incoming_link_established(link):
     RNS.log(f"Incoming link: {link}")
 
 def _noop_signal(sig, handler):
     pass
+
+def _startup_announce_loop():
+    """
+    FIX: Sideband re-announces periodically so peers that come online later
+    can discover it. A single announce at startup is often missed if the other
+    phone's RNode isn't fully ready yet.
+
+    Schedule:
+      +15s  — catch phones that were slow to connect
+      +60s  — catch phones that connected after initial announce
+      then every 10 min forever
+    """
+    for delay in [15, 60]:
+        time.sleep(delay)
+        if destination:
+            try:
+                destination.announce()
+                RNS.log(f"Startup re-announce at +{delay}s")
+            except Exception as e:
+                RNS.log(f"Re-announce error at +{delay}s: {e}")
+
+    while True:
+        time.sleep(600)  # 10 minutes
+        if destination:
+            try:
+                destination.announce()
+                RNS.log("Periodic re-announce sent (10 min)")
+            except Exception as e:
+                RNS.log(f"Periodic re-announce error: {e}")
 
 def _rns_main(bt_socket_wrapper):
     global destination, lxmf_router, reticulum
@@ -256,9 +321,15 @@ def _rns_main(bt_socket_wrapper):
         original_signal = signal.signal
         signal.signal = _noop_signal
 
+        # FIX: init Reticulum FIRST, then attach interface
+        # Previously the interface was appended before RNS.Reticulum() was
+        # called, which risked Transport reinitialising and orphaning the
+        # interface so inbound packets went nowhere.
+        reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
+
         iface = AndroidBTInterface(RNS.Transport, "RNodeBT", bt_socket_wrapper)
         RNS.Transport.interfaces.append(iface)
-        reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
+        RNS.log(f"AndroidBTInterface attached. Transport interfaces: {[i.name for i in RNS.Transport.interfaces]}")
 
         files_dir = "/data/data/com.example.rnshello/files"
         os.makedirs(files_dir, exist_ok=True)
@@ -297,11 +368,16 @@ def _rns_main(bt_socket_wrapper):
         destination.set_link_established_callback(incoming_link_established)
         lxmf_router.register_delivery_callback(message_received)
         RNS.Transport.register_announce_handler(AnnounceHandler())
+        RNS.Transport.register_announce_handler(RawAnnounceHandler())
 
+        # Initial announce
         destination.announce()
         addr = RNS.prettyhexrep(destination.hash).strip("<>")
         RNS.log(f"LXMF address announced: {addr}")
         _start_result["addr"] = addr
+
+        # FIX: start periodic re-announce loop (daemon thread, won't block shutdown)
+        threading.Thread(target=_startup_announce_loop, daemon=True).start()
 
     except Exception as e:
         import traceback
@@ -376,8 +452,6 @@ def send_message(dest_hash_hex, text):
         # Verify hash matches — if not, the identity is wrong
         if actual_hash != dest_hash_hex:
             RNS.log(f"HASH MISMATCH! Built {actual_hash} but want {dest_hash_hex}")
-            # Try using dest_hash directly as the lxmf delivery hash
-            # Some peers use a different derivation — send via raw packet path
             return f"Hash mismatch: got {actual_hash}, expected {dest_hash_hex}. Try re-scanning their address."
 
         # Request path before sending — helps on LoRa single-hop
