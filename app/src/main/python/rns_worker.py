@@ -61,7 +61,7 @@ def kiss_cmd(cmd, data=b""):
 
 def configure_rnode(socket):
     RNS.log("Configuring RNode radio parameters...")
-    socket.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x00])))  # radio OFF first
+    socket.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x00])))
     time.sleep(0.5)
     socket.write(kiss_cmd(CMD_FREQUENCY, struct.pack(">I", 433025000)))
     time.sleep(0.2)
@@ -194,6 +194,14 @@ class AnnounceHandler:
 def _noop_signal(sig, handler):
     pass
 
+def incoming_link_established(link):
+    """Accept incoming links so senders can deliver messages to us."""
+    RNS.log(f"Incoming link established: {link}")
+    link.set_packet_callback(incoming_link_packet)
+
+def incoming_link_packet(message, packet):
+    RNS.log(f"Packet on incoming link: {len(message)} bytes")
+
 def _rns_main(bt_socket_wrapper):
     global destination, lxmf_router, reticulum
     try:
@@ -207,14 +215,10 @@ def _rns_main(bt_socket_wrapper):
         original_signal = signal.signal
         signal.signal = _noop_signal
 
-        # Create interface BEFORE Reticulum() so Transport binds it correctly
         iface = AndroidBTInterface(RNS.Transport, "RNodeBT", bt_socket_wrapper)
-
         reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
-
-        # Append after init — Transport is now running and will process inbound
         RNS.Transport.interfaces.append(iface)
-        time.sleep(0.5)  # give Transport time to register the interface
+        time.sleep(0.5)
 
         files_dir = "/data/data/com.example.rnshello/files"
         os.makedirs(files_dir, exist_ok=True)
@@ -249,6 +253,9 @@ def _rns_main(bt_socket_wrapper):
             identity,
             display_name="RNS Hello Android"
         )
+        # Accept incoming links — without this the receiver never responds to link requests
+        destination.set_proof_strategy(RNS.Destination.PROVE_ALL)
+        destination.set_link_established_callback(incoming_link_established)
         lxmf_router.register_delivery_callback(message_received)
         RNS.Transport.register_announce_handler(AnnounceHandler())
 
@@ -300,9 +307,19 @@ def send_message(dest_hash_hex, text):
             RNS.log(f"Using cached identity for {dest_hash_hex}")
 
         if recalled_identity is None:
-            RNS.log("No identity known, requesting path...")
+            RNS.log("No identity known, requesting path and waiting...")
             RNS.Transport.request_path(dest_hash)
-            return "Unknown destination — ask them to tap Announce first"
+            for i in range(15):
+                time.sleep(2)
+                recalled_identity = known_identities.get(dest_hash_hex)
+                if recalled_identity is None:
+                    recalled_identity = RNS.Identity.recall(dest_hash)
+                if recalled_identity is not None:
+                    RNS.log(f"Got identity after {(i+1)*2}s")
+                    break
+
+        if recalled_identity is None:
+            return "No identity known for destination. Have they announced recently?"
 
         # Step 2: build LXMF destination
         lxmf_dest = RNS.Destination(
@@ -315,7 +332,7 @@ def send_message(dest_hash_hex, text):
         RNS.log(f"LXMF dest hash: {RNS.prettyhexrep(lxmf_dest.hash)}")
 
         # Step 3: send — DIRECT if path known, else PROPAGATED fallback
-        method = LXMF.LXMessage.DIRECT
+        method = LXMF.LXMessage.OPPORTUNISTIC
         if not RNS.Transport.has_path(lxmf_dest.hash):
             RNS.log("No path, will try DIRECT anyway (single-hop LoRa)")
 
