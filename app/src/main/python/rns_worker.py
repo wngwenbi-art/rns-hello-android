@@ -201,8 +201,11 @@ def message_received(message):
             text = message.content_as_string()
     except Exception:
         text = message.content_as_string()
+    # Strip null bytes and whitespace that LXMF sometimes adds
+    text = text.strip().strip("\x00")
     is_image = text.startswith("IMG:")
-    RNS.log(f"MSG RECEIVED from {sender}: {'[IMAGE]' if is_image else text}")
+    RNS.log(f"MSG RECEIVED from {sender}: type={type(text).__name__} len={len(text)} starts={repr(text[:20])}")
+    RNS.log(f"Is image: {is_image}")
     entry = {"from": sender, "text": text, "ts": ts, "direction": "in"}
     chat_messages.append(entry)
 

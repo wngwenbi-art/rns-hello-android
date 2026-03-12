@@ -223,9 +223,11 @@ class MainActivity : AppCompatActivity() {
             wrapper.addView(senderLabel)
         }
 
-        if (text.startsWith("IMG:")) {
+        val trimmedText = text.trim().trimStart('\u0000')
+        android.util.Log.d("ChatBubble", "text starts with: ${trimmedText.take(20)}, isImg=${trimmedText.startsWith("IMG:")}")
+        if (trimmedText.startsWith("IMG:")) {
             try {
-                val b64 = text.removePrefix("IMG:")
+                val b64 = trimmedText.removePrefix("IMG:")
                 val bytes = Base64.decode(b64, Base64.NO_WRAP)
                 val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                 wrapper.addView(ImageView(this).apply {
@@ -244,7 +246,7 @@ class MainActivity : AppCompatActivity() {
             }
         } else {
             wrapper.addView(TextView(this).apply {
-                this.text = text
+                this.text = trimmedText
                 textSize = 14f
                 setTextColor(Color.WHITE)
                 setPadding(16, 10, 16, 10)
