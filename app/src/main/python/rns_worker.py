@@ -192,29 +192,28 @@ def message_received(message):
     sender = RNS.prettyhexrep(message.source_hash).strip("<>")
     ts = time.strftime("%H:%M:%S")
 
-    # ── Check for image attachment first (Sideband-compatible) ────────────────
-    # LXMF.FIELD_FILE_ATTACHMENTS = 0x04
-    # Format: list of [filename, bytes]
-    FIELD_FILE_ATTACHMENTS = 0x04
+    # ── Check for image field first (Sideband-compatible) ────────────────────
+    # LXMF.FIELD_IMAGE = 0x06
+    # Format: [format_string, raw_bytes]  e.g. ["jpg", b"..."]
     try:
         fields = message.fields or {}
-        if FIELD_FILE_ATTACHMENTS in fields:
-            attachments = fields[FIELD_FILE_ATTACHMENTS]
-            if attachments:
-                filename, img_bytes = attachments[0][0], attachments[0][1]
-                if isinstance(img_bytes, (bytes, bytearray)) and len(img_bytes) > 0:
-                    b64 = _b64.b64encode(bytes(img_bytes)).decode("ascii")
-                    RNS.log(f"IMG RECEIVED from {sender}: {filename} ({len(img_bytes)} bytes)")
-                    with _data_lock:
-                        chat_messages.append({
-                            "from": sender,
-                            "text": f"IMG_B64:{b64}",
-                            "ts": ts,
-                            "direction": "in"
-                        })
-                    return
+        if LXMF.FIELD_IMAGE in fields:
+            image_field = fields[LXMF.FIELD_IMAGE]
+            img_fmt   = image_field[0]   # e.g. "jpg", "webp", "png"
+            img_bytes = image_field[1]
+            if isinstance(img_bytes, (bytes, bytearray)) and len(img_bytes) > 0:
+                b64 = _b64.b64encode(bytes(img_bytes)).decode("ascii")
+                RNS.log(f"IMG RECEIVED from {sender}: {img_fmt} ({len(img_bytes)} bytes)")
+                with _data_lock:
+                    chat_messages.append({
+                        "from": sender,
+                        "text": f"IMG_B64:{b64}",
+                        "ts": ts,
+                        "direction": "in"
+                    })
+                return
     except Exception as e:
-        RNS.log(f"Attachment parse error: {e}")
+        RNS.log(f"Image field parse error: {e}")
 
     # ── Regular text message ───────────────────────────────────────────────────
     text = ""
@@ -579,9 +578,15 @@ def send_message(dest_hash_hex, text):
 
 def send_image(dest_hash_hex, jpeg_b64):
     """
-    Send a JPEG image using LXMF.FIELD_FILE_ATTACHMENTS.
-    jpeg_b64: base64-encoded JPEG bytes (string).
+    Send a JPEG image using LXMF.FIELD_IMAGE (0x06).
+    jpeg_b64: base64-encoded JPEG bytes (string), already compressed by Kotlin side.
     Sideband-compatible: fields = {0x04: [["photo.jpg", raw_bytes]]}
+
+    LoRa delivery strategy:
+    - Use OPPORTUNISTIC so LXMF handles retries automatically.
+    - The link handshake over LoRa takes 10–30 s; LXMF's internal delivery
+      loop will keep trying until try_timeout (90 s here).
+    - The Kotlin side compresses to ≤ 10 KB before calling here.
     """
     import base64 as _b64
     global lxmf_router, destination, known_identities
@@ -611,22 +616,26 @@ def send_image(dest_hash_hex, jpeg_b64):
             return f"Hash mismatch: got {actual_hash}. Try re-scanning their address."
 
         img_bytes = _b64.b64decode(jpeg_b64)
-        RNS.log(f"Sending image to {dest_hash_hex}: {len(img_bytes)} bytes")
-
-        # Size warning — LoRa is slow, large images will take minutes
         kb = len(img_bytes) / 1024
-        if kb > 50:
-            RNS.log(f"Warning: image is {kb:.1f} KB — may be slow over LoRa")
+        RNS.log(f"Sending image to {dest_hash_hex}: {kb:.1f} KB")
 
-        FIELD_FILE_ATTACHMENTS = 0x04
+        # LXMF.FIELD_IMAGE = 0x06, format: [format_string, raw_bytes]
+        # This is what Sideband uses — fully interoperable.
         msg = LXMF.LXMessage(
             lxmf_dest,
             destination,
             "",
             title="",
             desired_method=LXMF.LXMessage.OPPORTUNISTIC,
-            fields={FIELD_FILE_ATTACHMENTS: [["photo.jpg", img_bytes]]}
+            fields={LXMF.FIELD_IMAGE: ["jpg", img_bytes]}
         )
+        # Give LoRa link handshake plenty of time — default is often too short.
+        # 90 s covers: link request + proof + data transfer for a ~10 KB image.
+        try:
+            msg.try_timeout = 90.0
+        except Exception:
+            pass  # older LXMF versions may not support this attribute
+
         msg.register_delivery_callback(lambda m: RNS.log(f"Image delivered! state={m.state}"))
         msg.register_failed_callback(lambda m: RNS.log(f"Image failed! state={m.state}"))
         lxmf_router.handle_outbound(msg)
@@ -640,7 +649,7 @@ def send_image(dest_hash_hex, jpeg_b64):
                 "direction": "out"
             })
         size_str = f"{kb:.1f} KB"
-        return f"Image sent ({size_str})"
+        return f"Sending image ({size_str}) — may take 30–90s over LoRa"
 
     except Exception as e:
         import traceback
