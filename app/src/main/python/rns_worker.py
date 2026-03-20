@@ -470,11 +470,21 @@ def _rns_main(bt_socket_wrapper):
             autopeer=True
         )
         signal.signal = original_signal
-        # LoRa link handshake needs more attempts than the default 5.
-        # Patch the class constant so all messages get more retries.
+        # Patch RNS and LXMF constants for LoRa reliability:
+        # 1. ESTABLISHMENT_TIMEOUT_PER_HOP: default is ~6s — far too short
+        #    for LoRa at 1200 baud where a single packet takes 2-4s to TX.
+        #    At 1 hop, the round-trip for link request + proof = 6-10s minimum.
+        #    Set to 30s per hop so a 1-hop link gets a full 30s to handshake.
+        # 2. MAX_DELIVERY_ATTEMPTS: default 5 — keep at 20 so the router
+        #    keeps retrying after a failed link attempt.
+        try:
+            RNS.Link.ESTABLISHMENT_TIMEOUT_PER_HOP = 30.0
+            RNS.log("Patched RNS Link.ESTABLISHMENT_TIMEOUT_PER_HOP=30s")
+        except Exception as e:
+            RNS.log(f"Could not patch ESTABLISHMENT_TIMEOUT_PER_HOP: {e}")
         try:
             LXMF.LXMRouter.MAX_DELIVERY_ATTEMPTS = 20
-            RNS.log("Patched LXMF MAX_DELIVERY_ATTEMPTS=20 for LoRa reliability")
+            RNS.log("Patched LXMF MAX_DELIVERY_ATTEMPTS=20")
         except Exception as e:
             RNS.log(f"Could not patch MAX_DELIVERY_ATTEMPTS: {e}")
 
