@@ -64,12 +64,14 @@ object RNSBridge {
     // ── Image sending ─────────────────────────────────────────────────────────
 
     /**
-     * Send a JPEG image via LXMF FIELD_FILE_ATTACHMENTS.
-     * [jpegBase64] is a base64-encoded JPEG string (no data: prefix).
+     * Send an image via RNS.Resource over a direct RNS.Link.
+     * Bypasses LXMF — Resource handles sequencing, retransmit and integrity.
+     * [webpBase64] is a base64-encoded WebP image (no data: prefix).
+     * Blocks the calling thread until delivery or timeout (~120s).
      * Returns "Image sent (X KB)" or an error string.
      */
-    fun sendImage(destHashHex: String, jpegBase64: String): String =
-        worker.callAttr("send_image", destHashHex, jpegBase64).toString()
+    fun sendImage(destHashHex: String, webpBase64: String): String =
+        worker.callAttr("send_image", destHashHex, webpBase64).toString()
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 

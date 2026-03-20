@@ -8,7 +8,8 @@ import struct
 from RNS.Interfaces.Interface import Interface
 from collections import deque
 
-destination = None
+destination       = None   # LXMF delivery destination
+image_destination = None   # Raw RNS destination for Resource-based image transfer
 lxmf_router = None
 reticulum    = None
 _rns_started = False
@@ -370,21 +371,58 @@ class RawAnnounceHandler:
 
 def incoming_link_established(link):
     """
-    Called when a remote peer opens a link to us.
-    Store it so send_image can reuse it instead of opening a competing link.
+    Called when a remote peer opens a link to our LXMF destination.
+    Used by LXMRouter internally — we just log it.
     """
-    peer_hash = RNS.prettyhexrep(link.destination.hash).strip("<>") if link.destination else None
-    RNS.log(f"Incoming link established from {peer_hash}: {link}")
-    if peer_hash:
-        with _data_lock:
-            active_links[peer_hash] = link
-        # When link closes, remove from cache
-        def on_close(lnk):
-            with _data_lock:
-                if active_links.get(peer_hash) is lnk:
-                    del active_links[peer_hash]
-            RNS.log(f"Link to {peer_hash} closed")
-        link.set_link_closed_callback(on_close)
+    peer_hash = None
+    try:
+        peer_hash = RNS.prettyhexrep(link.destination.hash).strip("<>")
+    except Exception:
+        pass
+    RNS.log(f"LXMF incoming link from {peer_hash}")
+
+def image_link_established(link):
+    """
+    Called when a remote peer opens a link to our IMAGE destination.
+    Set up Resource receive callbacks on this link.
+    """
+    import base64 as _b64
+
+    RNS.log(f"Image link established: {link}")
+
+    def resource_started(resource):
+        RNS.log(f"Image resource incoming: size={resource.total_size} bytes")
+        return True  # accept
+
+    def resource_concluded(resource):
+        if resource.status == RNS.Resource.COMPLETE:
+            try:
+                img_bytes = resource.data.read() if hasattr(resource.data, 'read') else bytes(resource.data)
+                b64 = _b64.b64encode(img_bytes).decode("ascii")
+                # Determine sender from the link's remote identity
+                try:
+                    sender_hash = RNS.prettyhexrep(link.get_remote_identity().hash).strip("<>")
+                except Exception:
+                    sender_hash = "unknown"
+                ts = time.strftime("%H:%M:%S")
+                kb = len(img_bytes) / 1024
+                RNS.log(f"Image resource COMPLETE from {sender_hash}: {kb:.1f} KB")
+                with _data_lock:
+                    chat_messages.append({
+                        "from": sender_hash,
+                        "text": f"IMG_B64:{b64}",
+                        "ts": ts,
+                        "direction": "in"
+                    })
+            except Exception as e:
+                import traceback
+                RNS.log(f"Image resource decode error: {traceback.format_exc()}")
+        else:
+            RNS.log(f"Image resource failed/incomplete: status={resource.status}")
+
+    link.set_resource_started_callback(resource_started)
+    link.set_resource_concluded_callback(resource_concluded)
+    link.set_link_closed_callback(lambda lnk: RNS.log("Image link closed"))
 
 def _noop_signal(sig, handler):
     pass
@@ -495,6 +533,24 @@ def _rns_main(bt_socket_wrapper):
         destination.set_proof_strategy(RNS.Destination.PROVE_ALL)
         destination.set_link_established_callback(incoming_link_established)
         lxmf_router.register_delivery_callback(message_received)
+
+        # ── Image destination — raw RNS, Resource-based transfer ──────────────
+        # Uses aspect "rnshello.image" so both sides can address it directly.
+        # A separate destination means we don't interfere with LXMF at all.
+        global image_destination
+        image_destination = RNS.Destination(
+            identity,
+            RNS.Destination.IN,
+            RNS.Destination.SINGLE,
+            "rnshello",
+            "image"
+        )
+        image_destination.set_proof_strategy(RNS.Destination.PROVE_ALL)
+        image_destination.set_link_established_callback(image_link_established)
+        image_destination.announce()
+        img_addr = RNS.prettyhexrep(image_destination.hash).strip("<>")
+        RNS.log(f"Image destination ready: {img_addr}")
+
         RNS.Transport.register_announce_handler(AnnounceHandler())
         RNS.Transport.register_announce_handler(RawAnnounceHandler())
 
@@ -609,90 +665,107 @@ def send_message(dest_hash_hex, text):
         RNS.log(f"send_message error: {traceback.format_exc()}")
         return f"Error: {e}"
 
-def send_image(dest_hash_hex, jpeg_b64):
+def send_image(dest_hash_hex, webp_b64):
     """
-    Send an image using the 'ia' field key (standard LXMF image attachment).
-    jpeg_b64: base64-encoded WebP bytes (string), compressed by Kotlin side
-              to ~3-6 KB via WebP q22 @ 320px — mirrors Sideband's strategy.
+    Send an image using RNS.Resource over a direct RNS.Link.
+    Bypasses LXMF entirely — Resource handles sequencing, retransmit,
+    integrity verification and reassembly natively. This is the correct
+    RNS mechanism for transferring arbitrary binary data over a Link.
 
-    Uses OPPORTUNISTIC method — auto-upgrades to link-based transfer if
-    payload exceeds single-packet limit. MAX_DELIVERY_ATTEMPTS patched to 20
-    at startup gives the LoRa link handshake enough retries to complete.
+    Flow:
+      1. Recall peer's identity from the announce cache
+      2. Build outgoing "rnshello.image" destination (same aspect the
+         receiver registered — this is how both sides find each other)
+      3. Open RNS.Link to that destination
+      4. On link ACTIVE: send RNS.Resource(img_bytes, link)
+      5. On resource delivered: add to chat, close link
+      6. On link/resource failure: log and return error via status dict
     """
     import base64 as _b64
-    global lxmf_router, destination, known_identities
-    if not lxmf_router or not destination:
+    global image_destination, known_identities
+
+    if not image_destination:
         return "Not connected"
+
     try:
         dest_hash_hex = dest_hash_hex.strip().strip("<>")
-        dest_hash = bytes.fromhex(dest_hash_hex)
+        img_bytes = _b64.b64decode(webp_b64)
+        kb = len(img_bytes) / 1024
+        RNS.log(f"send_image: {kb:.1f} KB to {dest_hash_hex}")
 
+        # Recall the peer's identity — needed to build the outgoing destination
         with _data_lock:
             recalled_identity = known_identities.get(dest_hash_hex)
         if recalled_identity is None:
-            recalled_identity = RNS.Identity.recall(dest_hash)
+            recalled_identity = RNS.Identity.recall(bytes.fromhex(dest_hash_hex))
         if recalled_identity is None:
-            RNS.Transport.request_path(dest_hash)
+            RNS.Transport.request_path(bytes.fromhex(dest_hash_hex))
             return "Unknown destination — ask them to tap Announce first"
 
-        lxmf_dest = RNS.Destination(
+        # Build outgoing "rnshello.image" destination for this peer
+        img_dest = RNS.Destination(
             recalled_identity,
             RNS.Destination.OUT,
             RNS.Destination.SINGLE,
-            "lxmf",
-            "delivery"
+            "rnshello",
+            "image"
         )
-        actual_hash = RNS.prettyhexrep(lxmf_dest.hash).strip("<>")
-        if actual_hash != dest_hash_hex:
-            return f"Hash mismatch: got {actual_hash}. Try re-scanning their address."
+        RNS.log(f"Image dest hash: {RNS.prettyhexrep(img_dest.hash)}")
 
-        img_bytes = _b64.b64decode(jpeg_b64)
-        kb = len(img_bytes) / 1024
-        RNS.log(f"Sending WebP image to {dest_hash_hex}: {kb:.1f} KB")
+        # Shared result dict for the async link/resource callbacks
+        result = {"done": threading.Event(), "status": "pending"}
 
-        msg = LXMF.LXMessage(
-            lxmf_dest,
-            destination,
-            "",
-            title="",
-            desired_method=LXMF.LXMessage.OPPORTUNISTIC,
-            fields={"ia": ["webp", img_bytes]}
-        )
-        msg.register_delivery_callback(lambda m: RNS.log(f"Image delivered! state={m.state}"))
-        msg.register_failed_callback(lambda m: RNS.log(f"Image failed! state={m.state}"))
-
-        # If the peer already has an active link open to us, reuse it to avoid
-        # a simultaneous link-open collision (both sides sending link requests
-        # at the same time — neither responds to the other's).
-        with _data_lock:
-            existing_link = active_links.get(dest_hash_hex)
-
-        if existing_link and existing_link.status == RNS.Link.ACTIVE:
-            RNS.log(f"Reusing existing active link to {dest_hash_hex}")
+        def link_established(link):
+            RNS.log(f"Image link ACTIVE, sending Resource ({kb:.1f} KB)...")
             try:
-                msg.set_delivery_via(existing_link)
+                def resource_concluded(resource):
+                    if resource.status == RNS.Resource.COMPLETE:
+                        RNS.log("Image Resource DELIVERED")
+                        ts = time.strftime("%H:%M:%S")
+                        with _data_lock:
+                            chat_messages.append({
+                                "from": "me",
+                                "text": f"IMG_B64:{webp_b64}",
+                                "ts": ts,
+                                "direction": "out"
+                            })
+                        result["status"] = "ok"
+                    else:
+                        RNS.log(f"Image Resource failed: status={resource.status}")
+                        result["status"] = f"Resource failed (status={resource.status})"
+                    link.teardown()
+                    result["done"].set()
+
+                resource = RNS.Resource(img_bytes, link, callback=resource_concluded)
+                RNS.log(f"Resource queued: {resource}")
             except Exception as e:
-                RNS.log(f"set_delivery_via not supported: {e} — falling back to handle_outbound")
+                import traceback
+                RNS.log(f"Resource send error: {traceback.format_exc()}")
+                result["status"] = f"Error: {e}"
+                link.teardown()
+                result["done"].set()
+
+        def link_closed(link):
+            if not result["done"].is_set():
+                RNS.log("Image link closed before Resource completed")
+                result["status"] = "Link closed before delivery"
+                result["done"].set()
+
+        # Open the link — callbacks fire on the RNS thread
+        link = RNS.Link(img_dest)
+        link.set_link_established_callback(link_established)
+        link.set_link_closed_callback(link_closed)
+        RNS.log("Image link opening...")
+
+        # Wait up to 120s for the full transfer (link + Resource)
+        result["done"].wait(timeout=120)
+
+        if result["status"] == "ok":
+            return f"Image sent ({kb:.1f} KB)"
+        elif result["status"] == "pending":
+            return "Timed out waiting for image delivery"
         else:
-            # No active link — random backoff before initiating to reduce
-            # chance of a simultaneous link-open collision with the remote side.
-            import random
-            backoff = random.uniform(1.0, 4.0)
-            RNS.log(f"No active link to {dest_hash_hex}, backoff {backoff:.1f}s before link open")
-            time.sleep(backoff)
-
-        lxmf_router.handle_outbound(msg)
-
-        ts = time.strftime("%H:%M:%S")
-        with _data_lock:
-            chat_messages.append({
-                "from": "me",
-                "text": f"IMG_B64:{jpeg_b64}",
-                "ts": ts,
-                "direction": "out"
-            })
-        size_str = f"{kb:.1f} KB"
-        return f"Sending image ({size_str}) — may take 30–90s over LoRa"
+            return result["status"]
 
     except Exception as e:
         import traceback
