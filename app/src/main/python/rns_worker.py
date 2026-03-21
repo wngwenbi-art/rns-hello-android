@@ -576,6 +576,32 @@ def _rns_main(bt_socket_wrapper):
         original_signal = signal.signal
         signal.signal = _noop_signal
 
+            # Clear stale RNS storage if from old non-transport build
+        version_file = "/data/data/com.example.rnshello/files/.rns_version"
+        current_version = "transport_v1"
+        needs_clear = True
+        try:
+            if os.path.exists(version_file):
+                with open(version_file) as vf:
+                    if vf.read().strip() == current_version:
+                        needs_clear = False
+        except Exception:
+            pass
+        if needs_clear:
+            import shutil
+            for stale in [configdir,
+                          "/data/data/com.example.rnshello/files/lxmf"]:
+                try:
+                    if os.path.exists(stale):
+                        shutil.rmtree(stale)
+                        RNS.log(f"Cleared stale storage: {stale}")
+                except Exception as e:
+                    RNS.log(f"Clear error: {e}")
+            os.makedirs(configdir, exist_ok=True)
+            with open(version_file, "w") as vf:
+                vf.write(current_version)
+            RNS.log("Storage cleared and version stamp written")
+
         reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
         RNS.log(f"Reticulum init done. Interfaces before add: {[i.name for i in RNS.Transport.interfaces]}")
 
@@ -683,6 +709,23 @@ def start(bt_socket_wrapper):
     if _start_result["error"]:
         return f"Error: {_start_result['error']}"
     return _start_result["addr"] or "Timeout"
+
+def clear_reticulum_storage():
+    """Delete cached RNS identity/path storage to force fresh state."""
+    import shutil
+    cleared = []
+    for path in [
+        "/data/data/com.example.rnshello/files/.reticulum",
+        "/data/data/com.example.rnshello/files/lxmf",
+    ]:
+        try:
+            if os.path.exists(path):
+                shutil.rmtree(path)
+                cleared.append(path)
+        except Exception as e:
+            cleared.append(f"ERROR {path}: {e}")
+    RNS.log(f"Cleared storage: {cleared}")
+    return f"Cleared: {', '.join(cleared)}"
 
 def announce():
     try:
