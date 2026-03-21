@@ -137,6 +137,14 @@ def configure_rnode(socket):
 class AndroidBTInterface(Interface):
     BITRATE_GUESS = 1200
 
+    # RNode split-packet constants
+    # RNode firmware splits packets > ~232 bytes into two LoRa frames.
+    # Each frame has a 1-byte header prepended:
+    #   bits 7-4: 4-bit sequence number (matches both halves of a split pair)
+    #   bit  0:   FLAG_SPLIT — set on BOTH frames of a split pair
+    RNODE_FLAG_SPLIT = 0x01
+    RNODE_SEQ_MASK   = 0xF0
+
     def __init__(self, owner, name, socket):
         super().__init__()
         self.owner                  = owner
@@ -177,6 +185,8 @@ class AndroidBTInterface(Interface):
         self._kiss_buf              = []
         self._in_frame              = False
         self._escape                = False
+        # Split-packet reassembly buffer: seq -> first_half_bytes
+        self._split_buf             = {}
         # NOTE: read loop is NOT started here — call start_reading() after
         # RNS.Reticulum() has fully initialised so Transport's reverse table
         # and interface lookup structures include this interface before any
@@ -197,20 +207,64 @@ class AndroidBTInterface(Interface):
                 RNS.log(f"BT read error: {e}")
                 self.online = False
 
+    def _dispatch_rnode_packet(self, raw):
+        """
+        Handle RNode split-packet reassembly then pass to Transport.inbound().
+
+        RNode firmware prepends a 1-byte header to every DATA frame:
+          bits 7-4 = 4-bit sequence number
+          bit    0 = FLAG_SPLIT (set on both halves of a split pair)
+
+        If FLAG_SPLIT is clear  → single complete packet, strip header, dispatch.
+        If FLAG_SPLIT is set    → store first half by seq; when second half
+                                  arrives with same seq, reassemble and dispatch.
+        Stale first-halves are discarded after the second split arrives with
+        a different seq (normal rolling replacement).
+        """
+        if len(raw) < 2:
+            return
+        hdr = raw[0]
+        payload = raw[1:]
+        flag_split = hdr & self.RNODE_FLAG_SPLIT
+        seq        = hdr & self.RNODE_SEQ_MASK
+
+        if not flag_split:
+            # Single complete packet
+            self._deliver(payload)
+        else:
+            if seq in self._split_buf:
+                # Second half — reassemble
+                first = self._split_buf.pop(seq)
+                full  = first + payload
+                RNS.log(f"Split packet reassembled: seq={seq>>4} total={len(full)} bytes")
+                self._deliver(full)
+            else:
+                # First half — store and wait
+                self._split_buf[seq] = payload
+                RNS.log(f"Split packet first half: seq={seq>>4} len={len(payload)}")
+                # Purge stale entries (keep only the last 4 sequences)
+                if len(self._split_buf) > 4:
+                    oldest = next(iter(self._split_buf))
+                    del self._split_buf[oldest]
+
+    def _deliver(self, pkt):
+        """Pass a complete reassembled packet to RNS Transport."""
+        if len(pkt) > 0:
+            self.rxb += len(pkt)
+            try:
+                self.owner.inbound(pkt, self)
+            except Exception as e:
+                RNS.log(f"inbound error: {e}")
+
     def _parse_kiss(self, data):
         for byte in data:
             if byte == KISS_FEND:
                 if self._in_frame and len(self._kiss_buf) > 1:
-                    pkt = bytes(self._kiss_buf[1:])
-                    if len(pkt) > 0:
-                        self.rxb += len(pkt)
-                        port = self._kiss_buf[0]
-                        RNS.log(f"RX KISS port=0x{port:02x} len={len(pkt)}")
-                        if port == CMD_DATA:
-                            try:
-                                self.owner.inbound(pkt, self)
-                            except Exception as e:
-                                RNS.log(f"inbound error: {e}")
+                    port = self._kiss_buf[0]
+                    body = bytes(self._kiss_buf[1:])
+                    RNS.log(f"RX KISS port=0x{port:02x} len={len(body)}")
+                    if port == CMD_DATA and len(body) > 0:
+                        self._dispatch_rnode_packet(body)
                 self._kiss_buf = []
                 self._in_frame = True
                 self._escape   = False
