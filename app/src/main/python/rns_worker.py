@@ -67,16 +67,6 @@ RNS_CONFIG = """
 
 [interfaces]
 
-  [[RNodeBT]]
-    type = RNodeInterface
-    interface_enabled = True
-    port = __FD_PATH__
-    frequency = {frequency}
-    bandwidth = {bandwidth}
-    txpower = {txpower}
-    spreadingfactor = {sf}
-    codingrate = {cr}
-
 """
 
 KISS_FEND       = 0xC0
@@ -141,58 +131,6 @@ def configure_rnode(socket):
     socket.write(kiss_cmd(CMD_READY, bytes([0x00])))
     time.sleep(0.2)
     RNS.log("RNode radio configured and ON")
-
-def _create_bt_socketpair(bt_socket_wrapper):
-    """
-    Create a socketpair() connecting our BT socket to RNodeInterface.
-
-    socketpair() creates two connected AF_UNIX sockets with no bind()/listen()
-    so it works on Android without EPERM from SELinux.
-
-    Returns the fd that RNodeInterface should use as its "serial port".
-    The other end is kept in a bridge thread piping to/from BT.
-    """
-    import socket as _socket
-
-    # Create connected socket pair
-    rni_sock, bridge_sock = _socket.socketpair(_socket.AF_UNIX, _socket.SOCK_STREAM)
-    RNS.log(f"BT socketpair created: rni_fd={rni_sock.fileno()} bridge_fd={bridge_sock.fileno()}")
-
-    stop = threading.Event()
-
-    def bt_to_rni():
-        """BT → RNodeInterface: forward RNode radio data"""
-        while not stop.is_set():
-            try:
-                data = bt_socket_wrapper.read(512)
-                if data and len(data) > 0:
-                    bridge_sock.sendall(bytes(data))
-            except Exception as e:
-                RNS.log(f"BT→RNI error: {e}")
-                stop.set()
-                break
-
-    def rni_to_bt():
-        """RNodeInterface → BT: forward KISS commands to RNode"""
-        while not stop.is_set():
-            try:
-                data = bridge_sock.recv(512)
-                if not data:
-                    stop.set()
-                    break
-                bt_socket_wrapper.write(data)
-            except Exception as e:
-                RNS.log(f"RNI→BT error: {e}")
-                stop.set()
-                break
-
-    threading.Thread(target=bt_to_rni, daemon=True).start()
-    threading.Thread(target=rni_to_bt, daemon=True).start()
-
-    # Return the file path that RNodeInterface can open
-    # We wrap rni_sock as a file-like serial port
-    return rni_sock
-
 
 class AndroidBTInterface(Interface):
     BITRATE_GUESS = 1200
@@ -601,39 +539,27 @@ def _startup_announce_loop():
 def _rns_main(bt_socket_wrapper):
     global destination, lxmf_router, reticulum
     try:
-        # 1. Build Reticulum config with RNodeInterface pointing at our TCP bridge
-        # NOTE: We do NOT call configure_rnode() here — RNodeInterface sends its
-        # own KISS config commands during init. Calling both would double-configure
-        # the RNode and leave it in a rejected state.
-        import rnode_config as _rc
-        cfg = _rc.get()
+        configure_rnode(bt_socket_wrapper)
+
         configdir = "/data/data/com.example.rnshello/files/.reticulum"
         os.makedirs(configdir, exist_ok=True)
-        rns_cfg = RNS_CONFIG.format(
-            frequency    = cfg["frequency"],
-            bandwidth    = cfg["bandwidth"],
-            txpower      = cfg["txpower"],
-            sf           = cfg["sf"],
-            cr           = cfg["cr"],
-        )
         with open(os.path.join(configdir, "config"), "w") as f:
-            f.write(rns_cfg)
-        RNS.log("RNS config written")
+            f.write(RNS_CONFIG)
 
-        # 3. Create BT socketpair — gives us an fd we can pass as a "serial port"
-        rni_sock = _create_bt_socketpair(bt_socket_wrapper)
-        time.sleep(0.3)  # Wait for bridge threads
-
-        # 4. Write final config with actual fd path BEFORE Reticulum init
-        fd_path = f"/proc/self/fd/{rni_sock.fileno()}"
-        rns_cfg_final = rns_cfg.replace("__FD_PATH__", fd_path)
-        with open(os.path.join(configdir, "config"), "w") as cf:
-            cf.write(rns_cfg_final)
-        RNS.log(f"Config written with fd path: {fd_path}")
-
-        # 5. Suppress signal() calls — on a background thread
+        # Suppress signal() calls — on a background thread
         original_signal = signal.signal
         signal.signal = _noop_signal
+
+        # Pre-register interface BEFORE Reticulum init
+        iface = AndroidBTInterface(RNS.Transport, "RNodeBT", bt_socket_wrapper)
+        RNS.Transport.interfaces.append(iface)
+        RNS.log(f"Interface pre-registered: {[i.name for i in RNS.Transport.interfaces]}")
+
+        reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
+        RNS.log(f"Reticulum init done. Interfaces: {[i.name for i in RNS.Transport.interfaces]}")
+
+        iface.start_reading()
+        RNS.log("BT read loop started")
 
         files_dir = "/data/data/com.example.rnshello/files"
         os.makedirs(files_dir, exist_ok=True)
@@ -657,13 +583,6 @@ def _rns_main(bt_socket_wrapper):
             except Exception as se:
                 RNS.log(f"Identity save error: {se}")
 
-        # 6. Init Reticulum — RNodeInterface reads config, opens fd_path as serial port
-        reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
-        RNS.log(f"Reticulum init done. Interfaces: {[i.name for i in RNS.Transport.interfaces]}")
-        signal.signal = original_signal
-
-        # LXMRouter also calls signal.signal internally — keep noop active through init
-        signal.signal = _noop_signal
         lxmf_router = LXMF.LXMRouter(
             storagepath="/data/data/com.example.rnshello/files/lxmf",
             autopeer=True
