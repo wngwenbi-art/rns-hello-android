@@ -252,6 +252,8 @@ class AndroidBTInterface(Interface):
                     body = bytes(self._kiss_buf[1:])
                     RNS.log(f"RX KISS port=0x{port:02x} len={len(body)}")
                     if port == CMD_DATA and len(body) > 0:
+                        # Log first 4 bytes to diagnose split-packet header presence
+                        RNS.log(f"RX DATA first4={body[:4].hex()} len={len(body)}")
                         self._deliver(body)
                 self._kiss_buf = []
                 self._in_frame = True
