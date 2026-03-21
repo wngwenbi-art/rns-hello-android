@@ -177,7 +177,15 @@ class AndroidBTInterface(Interface):
         self._kiss_buf              = []
         self._in_frame              = False
         self._escape                = False
+        # NOTE: read loop is NOT started here — call start_reading() after
+        # RNS.Reticulum() has fully initialised so Transport's reverse table
+        # and interface lookup structures include this interface before any
+        # inbound packets (including link proofs) are processed.
+
+    def start_reading(self):
+        """Start the BT read loop. Call this AFTER RNS.Reticulum() init."""
         threading.Thread(target=self._read_loop, daemon=True).start()
+        RNS.log(f"AndroidBTInterface read loop started for {self.name}")
 
     def _read_loop(self):
         while self.online:
@@ -543,15 +551,21 @@ def _rns_main(bt_socket_wrapper):
         original_signal = signal.signal
         signal.signal = _noop_signal
 
-        # FIX: init Reticulum FIRST, then attach interface
-        # Previously the interface was appended before RNS.Reticulum() was
-        # called, which risked Transport reinitialising and orphaning the
-        # interface so inbound packets went nowhere.
-        reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
-
+        # CORRECT INIT ORDER — critical for link proof routing:
+        # 1. Create interface WITHOUT starting read loop
+        # 2. Pre-register in Transport.interfaces BEFORE RNS.Reticulum() init
+        #    so Transport builds reverse_table/path_table with this interface
+        # 3. RNS.Reticulum() adopts all pre-registered interfaces during init
+        # 4. Start read loop AFTER — so link proofs hit a fully-built Transport
         iface = AndroidBTInterface(RNS.Transport, "RNodeBT", bt_socket_wrapper)
         RNS.Transport.interfaces.append(iface)
-        RNS.log(f"AndroidBTInterface attached. Transport interfaces: {[i.name for i in RNS.Transport.interfaces]}")
+        RNS.log(f"Interface pre-registered before Reticulum init: {[i.name for i in RNS.Transport.interfaces]}")
+
+        reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
+        RNS.log(f"Reticulum init done. Interfaces: {[i.name for i in RNS.Transport.interfaces]}")
+
+        iface.start_reading()
+        RNS.log("BT read loop started — Transport fully initialised")
 
         files_dir = "/data/data/com.example.rnshello/files"
         os.makedirs(files_dir, exist_ok=True)
