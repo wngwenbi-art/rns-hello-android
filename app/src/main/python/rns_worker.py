@@ -235,6 +235,22 @@ class AndroidBTInterface(Interface):
         except Exception as e:
             RNS.log(f"BT write error: {e}")
 
+# ── Image file storage ────────────────────────────────────────────────────────
+_IMAGES_DIR = "/data/data/com.example.rnshello/files/received_images"
+
+def _save_image_file(img_bytes: bytes, sender_hash: str) -> str:
+    """Save image bytes to a file, return the file path."""
+    import time as _time
+    os.makedirs(_IMAGES_DIR, exist_ok=True)
+    ts = _time.strftime("%Y%m%d_%H%M%S")
+    filename = f"img_{sender_hash[:8]}_{ts}.webp"
+    filepath = os.path.join(_IMAGES_DIR, filename)
+    with open(filepath, "wb") as f:
+        f.write(img_bytes)
+    RNS.log(f"Image saved to {filepath}")
+    return filepath
+
+
 def message_received(message):
     import base64 as _b64
     sender = RNS.prettyhexrep(message.source_hash).strip("<>")
@@ -250,12 +266,12 @@ def message_received(message):
             img_fmt   = image_field[0]   # e.g. "jpg", "webp", "png"
             img_bytes = image_field[1]
             if isinstance(img_bytes, (bytes, bytearray)) and len(img_bytes) > 0:
-                b64 = _b64.b64encode(bytes(img_bytes)).decode("ascii")
                 RNS.log(f"IMG RECEIVED from {sender}: {img_fmt} ({len(img_bytes)} bytes)")
+                filepath = _save_image_file(bytes(img_bytes), sender)
                 with _data_lock:
                     chat_messages.append({
                         "from": sender,
-                        "text": f"IMG_B64:{b64}",
+                        "text": f"IMG_FILE:{filepath}",
                         "ts": ts,
                         "direction": "in"
                     })
@@ -475,27 +491,26 @@ def image_link_established(link):
         if resource.status == RNS.Resource.COMPLETE:
             try:
                 img_bytes = resource.data.read() if hasattr(resource.data, 'read') else bytes(resource.data)
-                b64 = _b64.b64encode(img_bytes).decode("ascii")
-                # Determine sender from the link's remote identity
                 try:
                     sender_hash = RNS.prettyhexrep(link.get_remote_identity().hash).strip("<>")
                 except Exception:
                     sender_hash = "unknown"
-                ts = time.strftime("%H:%M:%S")
                 kb = len(img_bytes) / 1024
                 RNS.log(f"Image resource COMPLETE from {sender_hash}: {kb:.1f} KB")
+                filepath = _save_image_file(bytes(img_bytes), sender_hash)
+                ts = time.strftime("%H:%M:%S")
                 with _data_lock:
                     chat_messages.append({
                         "from": sender_hash,
-                        "text": f"IMG_B64:{b64}",
+                        "text": f"IMG_FILE:{filepath}",
                         "ts": ts,
                         "direction": "in"
                     })
             except Exception as e:
                 import traceback
-                RNS.log(f"Image resource decode error: {traceback.format_exc()}")
+                RNS.log(f"Image resource error: {traceback.format_exc()}")
         else:
-            RNS.log(f"Image resource failed/incomplete: status={resource.status}")
+            RNS.log(f"Image resource failed: status={resource.status}")
 
     # CRITICAL: must set ACCEPT_ALL or resource advertisements are silently rejected
     link.set_resource_strategy(RNS.Link.ACCEPT_ALL)
@@ -830,11 +845,15 @@ def send_image(dest_hash_hex, webp_b64):
                 def resource_concluded(resource):
                     if resource.status == RNS.Resource.COMPLETE:
                         RNS.log("Image Resource DELIVERED")
+                        try:
+                            sent_path = _save_image_file(_b64.b64decode(webp_b64), "me")
+                        except Exception:
+                            sent_path = ""
                         ts = time.strftime("%H:%M:%S")
                         with _data_lock:
                             chat_messages.append({
                                 "from": "me",
-                                "text": f"IMG_B64:{webp_b64}",
+                                "text": f"IMG_FILE:{sent_path}" if sent_path else "📷 Image sent",
                                 "ts": ts,
                                 "direction": "out"
                             })
