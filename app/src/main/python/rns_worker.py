@@ -62,9 +62,11 @@ active_links      = {}   # peer_hash -> active RNS.Link  # lxmf_hash -> rnshello
 
 RNS_CONFIG = """
 [reticulum]
-  enable_transport = True
-  share_instance = False
-  panic_on_interface_error = False
+  enable_transport = yes
+  share_instance = no
+  share_instance_port = 37428
+  panic_on_interface_error = no
+  use_implicit_proof = yes
 
 [interfaces]
 
@@ -601,6 +603,11 @@ def _rns_main(bt_socket_wrapper):
             with open(version_file, "w") as vf:
                 vf.write(current_version)
             RNS.log("Storage cleared and version stamp written")
+
+        # Write config fresh — must happen after storage clear
+        with open(os.path.join(configdir, "config"), "w") as _cf:
+            _cf.write(RNS_CONFIG)
+        RNS.log(f"Config written: {os.path.join(configdir, 'config')}")
 
         reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
         RNS.log(f"Reticulum init done. Interfaces before add: {[i.name for i in RNS.Transport.interfaces]}")
