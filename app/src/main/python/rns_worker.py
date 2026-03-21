@@ -59,6 +59,8 @@ known_identities  = {}  # plain hex (no <>) -> RNS.Identity
 active_links      = {}  # plain hex -> RNS.Link (most recent active link per peer)
 image_peer_hashes = {}  # lxmf_hash -> rnshello.image destination hash
 
+RNS_BT_TCP_PORT = 4242  # Local TCP port bridging BT <-> RNodeInterface
+
 RNS_CONFIG = """
 [reticulum]
   enable_transport = False
@@ -66,6 +68,16 @@ RNS_CONFIG = """
   panic_on_interface_error = False
 
 [interfaces]
+
+  [[RNodeBT]]
+    type = RNodeInterface
+    interface_enabled = True
+    port = tcp://localhost:4242
+    frequency = {frequency}
+    bandwidth = {bandwidth}
+    txpower = {txpower}
+    spreadingfactor = {sf}
+    codingrate = {cr}
 
 """
 
@@ -131,6 +143,74 @@ def configure_rnode(socket):
     socket.write(kiss_cmd(CMD_READY, bytes([0x00])))
     time.sleep(0.2)
     RNS.log("RNode radio configured and ON")
+
+def _start_bt_tcp_bridge(bt_socket_wrapper):
+    """
+    Start a local TCP server on RNS_BT_TCP_PORT.
+    RNodeInterface connects to this port and treats it as a serial/TCP RNode.
+    We pipe bytes bidirectionally between the TCP socket and the BT wrapper.
+    This lets us use the real RNodeInterface (with correct KISS/link handling)
+    instead of our custom AndroidBTInterface.
+    """
+    import socket as _socket
+
+    server = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    server.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", RNS_BT_TCP_PORT))
+    server.listen(1)
+    RNS.log(f"BT-TCP bridge listening on port {RNS_BT_TCP_PORT}")
+
+    def bridge_loop():
+        while True:
+            try:
+                conn, addr = server.accept()
+                RNS.log(f"RNodeInterface connected to BT-TCP bridge from {addr}")
+                conn.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+
+                stop = threading.Event()
+
+                def bt_to_tcp():
+                    """BT → TCP: forward RNode data to RNodeInterface"""
+                    while not stop.is_set():
+                        try:
+                            data = bt_socket_wrapper.read(512)
+                            if data and len(data) > 0:
+                                conn.sendall(bytes(data))
+                        except Exception as e:
+                            RNS.log(f"BT→TCP error: {e}")
+                            stop.set()
+                            break
+
+                def tcp_to_bt():
+                    """TCP → BT: forward RNodeInterface commands to RNode"""
+                    while not stop.is_set():
+                        try:
+                            data = conn.recv(512)
+                            if not data:
+                                stop.set()
+                                break
+                            bt_socket_wrapper.write(data)
+                        except Exception as e:
+                            RNS.log(f"TCP→BT error: {e}")
+                            stop.set()
+                            break
+
+                t1 = threading.Thread(target=bt_to_tcp, daemon=True)
+                t2 = threading.Thread(target=tcp_to_bt, daemon=True)
+                t1.start()
+                t2.start()
+                stop.wait()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                RNS.log("BT-TCP bridge connection closed, waiting for reconnect...")
+            except Exception as e:
+                RNS.log(f"Bridge loop error: {e}")
+                time.sleep(1)
+
+    threading.Thread(target=bridge_loop, daemon=True).start()
+
 
 class AndroidBTInterface(Interface):
     BITRATE_GUESS = 1200
@@ -539,32 +619,33 @@ def _startup_announce_loop():
 def _rns_main(bt_socket_wrapper):
     global destination, lxmf_router, reticulum
     try:
+        # 1. Configure the RNode radio parameters via BT
         configure_rnode(bt_socket_wrapper)
 
+        # 2. Build Reticulum config with RNodeInterface pointing at our TCP bridge
+        import rnode_config as _rc
+        cfg = _rc.get()
         configdir = "/data/data/com.example.rnshello/files/.reticulum"
         os.makedirs(configdir, exist_ok=True)
+        rns_cfg = RNS_CONFIG.format(
+            frequency    = cfg["frequency"],
+            bandwidth    = cfg["bandwidth"],
+            txpower      = cfg["txpower"],
+            sf           = cfg["sf"],
+            cr           = cfg["cr"],
+        )
         with open(os.path.join(configdir, "config"), "w") as f:
-            f.write(RNS_CONFIG)
+            f.write(rns_cfg)
+        RNS.log(f"RNS config written with RNodeInterface tcp://localhost:{RNS_BT_TCP_PORT}")
 
-        # Suppress signal() calls — we're on a background thread, not main
+        # 3. Start the BT-TCP bridge BEFORE Reticulum init so the port is
+        #    listening when RNodeInterface tries to connect during init.
+        _start_bt_tcp_bridge(bt_socket_wrapper)
+        time.sleep(0.5)  # Brief wait for server socket to be ready
+
+        # 4. Suppress signal() calls — on a background thread
         original_signal = signal.signal
         signal.signal = _noop_signal
-
-        # CORRECT INIT ORDER — critical for link proof routing:
-        # 1. Create interface WITHOUT starting read loop
-        # 2. Pre-register in Transport.interfaces BEFORE RNS.Reticulum() init
-        #    so Transport builds reverse_table/path_table with this interface
-        # 3. RNS.Reticulum() adopts all pre-registered interfaces during init
-        # 4. Start read loop AFTER — so link proofs hit a fully-built Transport
-        iface = AndroidBTInterface(RNS.Transport, "RNodeBT", bt_socket_wrapper)
-        RNS.Transport.interfaces.append(iface)
-        RNS.log(f"Interface pre-registered before Reticulum init: {[i.name for i in RNS.Transport.interfaces]}")
-
-        reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
-        RNS.log(f"Reticulum init done. Interfaces: {[i.name for i in RNS.Transport.interfaces]}")
-
-        iface.start_reading()
-        RNS.log("BT read loop started — Transport fully initialised")
 
         files_dir = "/data/data/com.example.rnshello/files"
         os.makedirs(files_dir, exist_ok=True)
@@ -588,7 +669,13 @@ def _rns_main(bt_socket_wrapper):
             except Exception as se:
                 RNS.log(f"Identity save error: {se}")
 
+        # 5. Init Reticulum — RNodeInterface reads config and connects to TCP bridge
+        reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
+        RNS.log(f"Reticulum init done. Interfaces: {[i.name for i in RNS.Transport.interfaces]}")
+        signal.signal = original_signal
+
         # LXMRouter also calls signal.signal internally — keep noop active through init
+        signal.signal = _noop_signal
         lxmf_router = LXMF.LXMRouter(
             storagepath="/data/data/com.example.rnshello/files/lxmf",
             autopeer=True
@@ -845,14 +932,20 @@ def send_image(dest_hash_hex, webp_b64):
                 result["done"].set()
 
         # Open the link — callbacks fire on the RNS thread
-        # Re-announce our image destination immediately before opening the link.
-        # The remote side needs a valid path to US in order to generate and
-        # send back the link proof. Without this, they receive our link request
-        # but can't find a path to our image destination to sign the proof.
+        # Re-announce our image destination before opening the link.
+        # The remote needs a valid path to OUR image destination to generate
+        # the link proof. The announce must propagate AND be processed on their
+        # side before our link request arrives.
+        #
+        # LoRa timing at SF8/BW125k: ~1 airtime/packet + processing.
+        # Previous attempts showed the proof arriving ~12s after link request
+        # when the path wasn't ready. We wait long enough for the announce to
+        # arrive, be processed, path table updated, then open the link.
         if image_destination:
             image_destination.announce()
-            RNS.log("Re-announced image destination before link open")
-            time.sleep(1.5)  # Brief wait for announce to propagate over LoRa
+            RNS.log("Re-announced image destination before link open — waiting for propagation")
+            time.sleep(5.0)  # Wait for announce to arrive and be processed on remote side
+            RNS.log("Propagation wait complete, opening link...")
 
         link = RNS.Link(img_dest)
         link.set_link_established_callback(link_established)
