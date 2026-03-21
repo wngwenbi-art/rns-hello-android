@@ -845,6 +845,15 @@ def send_image(dest_hash_hex, webp_b64):
                 result["done"].set()
 
         # Open the link — callbacks fire on the RNS thread
+        # Re-announce our image destination immediately before opening the link.
+        # The remote side needs a valid path to US in order to generate and
+        # send back the link proof. Without this, they receive our link request
+        # but can't find a path to our image destination to sign the proof.
+        if image_destination:
+            image_destination.announce()
+            RNS.log("Re-announced image destination before link open")
+            time.sleep(1.5)  # Brief wait for announce to propagate over LoRa
+
         link = RNS.Link(img_dest)
         link.set_link_established_callback(link_established)
         link.set_link_closed_callback(link_closed)
