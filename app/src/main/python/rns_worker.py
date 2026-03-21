@@ -768,9 +768,27 @@ def send_image(dest_hash_hex, webp_b64):
             img_dest_hex = image_peer_hashes.get(dest_hash_hex)
             recalled_identity = known_identities.get(dest_hash_hex)
 
+        # Debug: log what we know
+        RNS.log(f"image_peer_hashes keys: {list(image_peer_hashes.keys())}")
+        RNS.log(f"img_dest_hex for peer: {img_dest_hex}")
+
         if img_dest_hex is None:
             # Never received their rnshello.image announce yet
-            # Request path and ask user to wait for announce
+            # Try to derive it directly from their identity if we have it
+            if recalled_identity is not None:
+                try:
+                    derived = RNS.Destination(
+                        recalled_identity,
+                        RNS.Destination.OUT,
+                        RNS.Destination.SINGLE,
+                        "rnshello", "image"
+                    )
+                    img_dest_hex = RNS.prettyhexrep(derived.hash).strip("<>")
+                    RNS.log(f"Derived image hash from identity: {img_dest_hex}")
+                except Exception as e:
+                    RNS.log(f"Could not derive image hash: {e}")
+
+        if img_dest_hex is None:
             RNS.Transport.request_path(bytes.fromhex(dest_hash_hex))
             return ("Image destination unknown — wait for peer to announce "
                     "or ask them to tap Announce first")
