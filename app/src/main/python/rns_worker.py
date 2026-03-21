@@ -61,10 +61,8 @@ image_peer_hashes = {}  # lxmf_hash -> rnshello.image destination hash
 
 RNS_CONFIG = """
 [reticulum]
-  enable_transport = True
-  share_instance = True
-  shared_instance_port = 37428
-  instance_control_port = 37429
+  enable_transport = False
+  share_instance = False
   panic_on_interface_error = False
 
 [interfaces]
