@@ -59,8 +59,6 @@ known_identities  = {}  # plain hex (no <>) -> RNS.Identity
 active_links      = {}  # plain hex -> RNS.Link (most recent active link per peer)
 image_peer_hashes = {}  # lxmf_hash -> rnshello.image destination hash
 
-RNS_BT_TCP_PORT = 4242  # Local TCP port bridging BT <-> RNodeInterface
-
 RNS_CONFIG = """
 [reticulum]
   enable_transport = False
@@ -68,16 +66,6 @@ RNS_CONFIG = """
   panic_on_interface_error = False
 
 [interfaces]
-
-  [[RNodeBT]]
-    type = RNodeInterface
-    interface_enabled = True
-    port = tcp://localhost:4242
-    frequency = {frequency}
-    bandwidth = {bandwidth}
-    txpower = {txpower}
-    spreadingfactor = {sf}
-    codingrate = {cr}
 
 """
 
@@ -144,72 +132,56 @@ def configure_rnode(socket):
     time.sleep(0.2)
     RNS.log("RNode radio configured and ON")
 
-def _start_bt_tcp_bridge(bt_socket_wrapper):
+def _create_bt_socketpair(bt_socket_wrapper):
     """
-    Start a local TCP server on RNS_BT_TCP_PORT.
-    RNodeInterface connects to this port and treats it as a serial/TCP RNode.
-    We pipe bytes bidirectionally between the TCP socket and the BT wrapper.
-    This lets us use the real RNodeInterface (with correct KISS/link handling)
-    instead of our custom AndroidBTInterface.
+    Create a socketpair() connecting our BT socket to RNodeInterface.
+
+    socketpair() creates two connected AF_UNIX sockets with no bind()/listen()
+    so it works on Android without EPERM from SELinux.
+
+    Returns the fd that RNodeInterface should use as its "serial port".
+    The other end is kept in a bridge thread piping to/from BT.
     """
     import socket as _socket
 
-    server = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-    server.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", RNS_BT_TCP_PORT))
-    server.listen(1)
-    RNS.log(f"BT-TCP bridge listening on port {RNS_BT_TCP_PORT}")
+    # Create connected socket pair
+    rni_sock, bridge_sock = _socket.socketpair(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    RNS.log(f"BT socketpair created: rni_fd={rni_sock.fileno()} bridge_fd={bridge_sock.fileno()}")
 
-    def bridge_loop():
-        while True:
+    stop = threading.Event()
+
+    def bt_to_rni():
+        """BT → RNodeInterface: forward RNode radio data"""
+        while not stop.is_set():
             try:
-                conn, addr = server.accept()
-                RNS.log(f"RNodeInterface connected to BT-TCP bridge from {addr}")
-                conn.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
-
-                stop = threading.Event()
-
-                def bt_to_tcp():
-                    """BT → TCP: forward RNode data to RNodeInterface"""
-                    while not stop.is_set():
-                        try:
-                            data = bt_socket_wrapper.read(512)
-                            if data and len(data) > 0:
-                                conn.sendall(bytes(data))
-                        except Exception as e:
-                            RNS.log(f"BT→TCP error: {e}")
-                            stop.set()
-                            break
-
-                def tcp_to_bt():
-                    """TCP → BT: forward RNodeInterface commands to RNode"""
-                    while not stop.is_set():
-                        try:
-                            data = conn.recv(512)
-                            if not data:
-                                stop.set()
-                                break
-                            bt_socket_wrapper.write(data)
-                        except Exception as e:
-                            RNS.log(f"TCP→BT error: {e}")
-                            stop.set()
-                            break
-
-                t1 = threading.Thread(target=bt_to_tcp, daemon=True)
-                t2 = threading.Thread(target=tcp_to_bt, daemon=True)
-                t1.start()
-                t2.start()
-                stop.wait()
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                RNS.log("BT-TCP bridge connection closed, waiting for reconnect...")
+                data = bt_socket_wrapper.read(512)
+                if data and len(data) > 0:
+                    bridge_sock.sendall(bytes(data))
             except Exception as e:
-                RNS.log(f"Bridge loop error: {e}")
-                time.sleep(1)
+                RNS.log(f"BT→RNI error: {e}")
+                stop.set()
+                break
 
-    threading.Thread(target=bridge_loop, daemon=True).start()
+    def rni_to_bt():
+        """RNodeInterface → BT: forward KISS commands to RNode"""
+        while not stop.is_set():
+            try:
+                data = bridge_sock.recv(512)
+                if not data:
+                    stop.set()
+                    break
+                bt_socket_wrapper.write(data)
+            except Exception as e:
+                RNS.log(f"RNI→BT error: {e}")
+                stop.set()
+                break
+
+    threading.Thread(target=bt_to_rni, daemon=True).start()
+    threading.Thread(target=rni_to_bt, daemon=True).start()
+
+    # Return the file path that RNodeInterface can open
+    # We wrap rni_sock as a file-like serial port
+    return rni_sock
 
 
 class AndroidBTInterface(Interface):
@@ -619,10 +591,10 @@ def _startup_announce_loop():
 def _rns_main(bt_socket_wrapper):
     global destination, lxmf_router, reticulum
     try:
-        # 1. Configure the RNode radio parameters via BT
-        configure_rnode(bt_socket_wrapper)
-
-        # 2. Build Reticulum config with RNodeInterface pointing at our TCP bridge
+        # 1. Build Reticulum config with RNodeInterface pointing at our TCP bridge
+        # NOTE: We do NOT call configure_rnode() here — RNodeInterface sends its
+        # own KISS config commands during init. Calling both would double-configure
+        # the RNode and leave it in a rejected state.
         import rnode_config as _rc
         cfg = _rc.get()
         configdir = "/data/data/com.example.rnshello/files/.reticulum"
@@ -636,12 +608,11 @@ def _rns_main(bt_socket_wrapper):
         )
         with open(os.path.join(configdir, "config"), "w") as f:
             f.write(rns_cfg)
-        RNS.log(f"RNS config written with RNodeInterface tcp://localhost:{RNS_BT_TCP_PORT}")
+        RNS.log("RNS config written")
 
-        # 3. Start the BT-TCP bridge BEFORE Reticulum init so the port is
-        #    listening when RNodeInterface tries to connect during init.
-        _start_bt_tcp_bridge(bt_socket_wrapper)
-        time.sleep(0.5)  # Brief wait for server socket to be ready
+        # 3. Create BT socketpair bridge and RNodeInterface
+        rni_sock = _create_bt_socketpair(bt_socket_wrapper)
+        time.sleep(0.3)  # Wait for bridge threads
 
         # 4. Suppress signal() calls — on a background thread
         original_signal = signal.signal
@@ -671,7 +642,22 @@ def _rns_main(bt_socket_wrapper):
 
         # 5. Init Reticulum — RNodeInterface reads config and connects to TCP bridge
         reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
-        RNS.log(f"Reticulum init done. Interfaces: {[i.name for i in RNS.Transport.interfaces]}")
+
+        # Create RNodeInterface using our socketpair fd as the port
+        # RNodeInterface expects a serial-port-like object; we pass the socket fd
+        import RNS.Interfaces.RNodeInterface as _RNI
+        iface = _RNI.RNodeInterface(
+            RNS.Transport,
+            "RNodeBT",
+            port           = rni_sock,
+            frequency      = cfg["frequency"],
+            bandwidth      = cfg["bandwidth"],
+            txpower        = cfg["txpower"],
+            spreadingfactor= cfg["sf"],
+            codingrate     = cfg["cr"],
+        )
+        RNS.Transport.interfaces.append(iface)
+        RNS.log(f"RNodeInterface created. Interfaces: {[i.name for i in RNS.Transport.interfaces]}")
         signal.signal = original_signal
 
         # LXMRouter also calls signal.signal internally — keep noop active through init
