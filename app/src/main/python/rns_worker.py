@@ -8,6 +8,41 @@ import struct
 from RNS.Interfaces.Interface import Interface
 from collections import deque
 
+# ── Patch LoRa timeouts at module import — MUST be before any RNS init ───────
+# ESTABLISHMENT_TIMEOUT_PER_HOP default is 5s. At LoRa 1200 baud a single
+# packet takes ~0.8s to TX. Round-trip for link handshake = 6-12s minimum.
+# Patch here so it applies to every Link object created anywhere in this process.
+def _patch_rns_for_lora():
+    patched = []
+    for _attr in ["ESTABLISHMENT_TIMEOUT_PER_HOP", "LINK_ESTABLISHMENT_TIMEOUT",
+                  "establishment_timeout_per_hop", "TIMEOUT_PER_HOP"]:
+        try:
+            old = getattr(RNS.Link, _attr, None)
+            if old is not None:
+                setattr(RNS.Link, _attr, 60.0)
+                patched.append(f"RNS.Link.{_attr}: {old}→60.0")
+        except Exception:
+            pass
+    # Also patch keepalive — default fires too quickly during Resource transfer
+    for _attr in ["KEEPALIVE_TIMEOUT_FACTOR", "KEEPALIVE", "keepalive"]:
+        try:
+            old = getattr(RNS.Link, _attr, None)
+            if old is not None:
+                setattr(RNS.Link, _attr, 360)   # 6 minutes
+                patched.append(f"RNS.Link.{_attr}: {old}→360")
+        except Exception:
+            pass
+    if patched:
+        RNS.log("LoRa patches applied: " + ", ".join(patched))
+    else:
+        # Log all Link attrs so we know what's available
+        attrs = [f"{a}={getattr(RNS.Link,a)}" for a in dir(RNS.Link)
+                 if not a.startswith("_") and isinstance(getattr(RNS.Link,a,None),(int,float))]
+        RNS.log("WARNING: No timeout attrs patched. RNS.Link numeric attrs: " + str(attrs))
+
+_patch_rns_for_lora()
+# ─────────────────────────────────────────────────────────────────────────────
+
 destination       = None   # LXMF delivery destination
 image_destination = None   # Raw RNS destination for Resource-based image transfer
 lxmf_router = None
@@ -20,8 +55,9 @@ _start_result = {"addr": None, "error": None}
 _data_lock    = threading.Lock()
 chat_messages = deque(maxlen=500)   # FIX: was unbounded list, now capped
 seen_announces = []
-known_identities = {}  # plain hex (no <>) -> RNS.Identity
-active_links  = {}     # plain hex -> RNS.Link (most recent active link per peer)
+known_identities  = {}  # plain hex (no <>) -> RNS.Identity
+active_links      = {}  # plain hex -> RNS.Link (most recent active link per peer)
+image_peer_hashes = {}  # lxmf_hash -> rnshello.image destination hash
 
 RNS_CONFIG = """
 [reticulum]
@@ -369,6 +405,37 @@ class RawAnnounceHandler:
     def received_announce(self, destination_hash, announced_identity, app_data):
         RNS.log(f"*** RAW ANNOUNCE: {RNS.prettyhexrep(destination_hash)} app_data={app_data}")
 
+class ImageAnnounceHandler:
+    """
+    Listens for rnshello.image announces from peers.
+    Maps their LXMF hash → their image destination hash so send_image
+    can open a link to the correct destination.
+    """
+    aspect_filter = "rnshello.image"
+
+    def received_announce(self, destination_hash, announced_identity, app_data):
+        img_hash = RNS.prettyhexrep(destination_hash).strip("<>")
+        RNS.log(f"*** IMAGE ANNOUNCE: {img_hash}")
+        if announced_identity is not None:
+            # The identity hash is the same as their LXMF identity hash
+            # (both use the same RNS.Identity). Store the mapping.
+            # We compute the LXMF delivery hash from this identity.
+            try:
+                lxmf_dest = RNS.Destination(
+                    announced_identity,
+                    RNS.Destination.OUT,
+                    RNS.Destination.SINGLE,
+                    "lxmf",
+                    "delivery"
+                )
+                lxmf_hash = RNS.prettyhexrep(lxmf_dest.hash).strip("<>")
+                with _data_lock:
+                    image_peer_hashes[lxmf_hash] = img_hash
+                    known_identities[lxmf_hash]  = announced_identity
+                RNS.log(f"Image hash mapped: lxmf={lxmf_hash} → img={img_hash}")
+            except Exception as e:
+                RNS.log(f"ImageAnnounceHandler error: {e}")
+
 def incoming_link_established(link):
     """
     Called when a remote peer opens a link to our LXMF destination.
@@ -514,18 +581,7 @@ def _rns_main(bt_socket_wrapper):
             autopeer=True
         )
         signal.signal = original_signal
-        # Patch RNS and LXMF constants for LoRa reliability:
-        # 1. ESTABLISHMENT_TIMEOUT_PER_HOP: default is ~6s — far too short
-        #    for LoRa at 1200 baud where a single packet takes 2-4s to TX.
-        #    At 1 hop, the round-trip for link request + proof = 6-10s minimum.
-        #    Set to 30s per hop so a 1-hop link gets a full 30s to handshake.
-        # 2. MAX_DELIVERY_ATTEMPTS: default 5 — keep at 20 so the router
-        #    keeps retrying after a failed link attempt.
-        try:
-            RNS.Link.ESTABLISHMENT_TIMEOUT_PER_HOP = 30.0
-            RNS.log("Patched RNS Link.ESTABLISHMENT_TIMEOUT_PER_HOP=30s")
-        except Exception as e:
-            RNS.log(f"Could not patch ESTABLISHMENT_TIMEOUT_PER_HOP: {e}")
+        # MAX_DELIVERY_ATTEMPTS — increase for LoRa reliability
         try:
             LXMF.LXMRouter.MAX_DELIVERY_ATTEMPTS = 20
             RNS.log("Patched LXMF MAX_DELIVERY_ATTEMPTS=20")
@@ -558,6 +614,7 @@ def _rns_main(bt_socket_wrapper):
         RNS.log(f"Image destination ready: {img_addr}")
 
         RNS.Transport.register_announce_handler(AnnounceHandler())
+        RNS.Transport.register_announce_handler(ImageAnnounceHandler())
         RNS.Transport.register_announce_handler(RawAnnounceHandler())
 
         # Initial announce
@@ -699,16 +756,24 @@ def send_image(dest_hash_hex, webp_b64):
         kb = len(img_bytes) / 1024
         RNS.log(f"send_image: {kb:.1f} KB to {dest_hash_hex}")
 
-        # Recall the peer's identity — needed to build the outgoing destination
+        # Look up peer's image destination hash from announce cache
         with _data_lock:
+            img_dest_hex = image_peer_hashes.get(dest_hash_hex)
             recalled_identity = known_identities.get(dest_hash_hex)
+
+        if img_dest_hex is None:
+            # Never received their rnshello.image announce yet
+            # Request path and ask user to wait for announce
+            RNS.Transport.request_path(bytes.fromhex(dest_hash_hex))
+            return ("Image destination unknown — wait for peer to announce "
+                    "or ask them to tap Announce first")
+
         if recalled_identity is None:
             recalled_identity = RNS.Identity.recall(bytes.fromhex(dest_hash_hex))
         if recalled_identity is None:
-            RNS.Transport.request_path(bytes.fromhex(dest_hash_hex))
-            return "Unknown destination — ask them to tap Announce first"
+            return "Unknown peer identity — ask them to tap Announce first"
 
-        # Build outgoing "rnshello.image" destination for this peer
+        # Build outgoing destination using the exact hash we received from their announce
         img_dest = RNS.Destination(
             recalled_identity,
             RNS.Destination.OUT,
@@ -716,7 +781,13 @@ def send_image(dest_hash_hex, webp_b64):
             "rnshello",
             "image"
         )
-        RNS.log(f"Image dest hash: {RNS.prettyhexrep(img_dest.hash)}")
+        actual_img_hash = RNS.prettyhexrep(img_dest.hash).strip("<>")
+        RNS.log(f"Image dest hash: {actual_img_hash} (expected: {img_dest_hex})")
+        if actual_img_hash != img_dest_hex:
+            # Hash mismatch — use the raw known hash directly
+            RNS.log(f"Hash mismatch — using raw hash {img_dest_hex}")
+            img_dest_bytes = bytes.fromhex(img_dest_hex)
+            img_dest = RNS.Destination.recall(img_dest_bytes) if hasattr(RNS.Destination, 'recall') else img_dest
 
         # Shared result dict for the async link/resource callbacks
         result = {"done": threading.Event(), "status": "pending"}
