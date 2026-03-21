@@ -420,6 +420,12 @@ def image_link_established(link):
         else:
             RNS.log(f"Image resource failed/incomplete: status={resource.status}")
 
+    # Keep the link alive during the slow incoming Resource transfer
+    try:
+        link.set_keepalive(120)
+        RNS.log("Incoming image link keepalive set to 120s")
+    except Exception as ke:
+        RNS.log(f"set_keepalive not available: {ke}")
     link.set_resource_started_callback(resource_started)
     link.set_resource_concluded_callback(resource_concluded)
     link.set_link_closed_callback(lambda lnk: RNS.log("Image link closed"))
@@ -718,6 +724,15 @@ def send_image(dest_hash_hex, webp_b64):
         def link_established(link):
             RNS.log(f"Image link ACTIVE, sending Resource ({kb:.1f} KB)...")
             try:
+                # ── Keep the link alive during the slow Resource transfer ──────
+                # Default keepalive is too short for LoRa at 1200 baud.
+                # Set to 120s so the link watchdog doesn't fire mid-transfer.
+                try:
+                    link.set_keepalive(120)
+                    RNS.log("Link keepalive set to 120s")
+                except Exception as ke:
+                    RNS.log(f"set_keepalive not available: {ke}")
+
                 def resource_concluded(resource):
                     if resource.status == RNS.Resource.COMPLETE:
                         RNS.log("Image Resource DELIVERED")
@@ -737,7 +752,7 @@ def send_image(dest_hash_hex, webp_b64):
                     result["done"].set()
 
                 resource = RNS.Resource(img_bytes, link, callback=resource_concluded)
-                RNS.log(f"Resource queued: {resource}")
+                RNS.log(f"Resource queued, segments={getattr(resource, 'total_parts', '?')}")
             except Exception as e:
                 import traceback
                 RNS.log(f"Resource send error: {traceback.format_exc()}")
@@ -757,8 +772,8 @@ def send_image(dest_hash_hex, webp_b64):
         link.set_link_closed_callback(link_closed)
         RNS.log("Image link opening...")
 
-        # Wait up to 120s for the full transfer (link + Resource)
-        result["done"].wait(timeout=120)
+        # Wait up to 180s — link open + Resource transfer at LoRa speeds
+        result["done"].wait(timeout=180)
 
         if result["status"] == "ok":
             return f"Image sent ({kb:.1f} KB)"
