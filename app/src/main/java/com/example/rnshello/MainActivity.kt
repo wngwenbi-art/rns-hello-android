@@ -30,6 +30,7 @@ import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.MultiFormatWriter
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.*
 
 class MainActivity : AppCompatActivity() {
@@ -346,10 +347,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         val trimmed = text.trim().trimStart('\u0000')
-        wrapper.addView(
-            if (trimmed.startsWith("IMG_B64:") || trimmed.startsWith("IMG:")) buildImageBubble(trimmed, isOutgoing)
-            else buildTextBubble(trimmed, isOutgoing)
-        )
+        wrapper.addView(when {
+            trimmed.startsWith("IMG_FILE:") -> buildImageFileCard(trimmed.removePrefix("IMG_FILE:"), isOutgoing)
+            trimmed.startsWith("IMG_B64:") || trimmed.startsWith("IMG:") -> buildImageBubble(trimmed, isOutgoing)
+            else -> buildTextBubble(trimmed, isOutgoing)
+        })
 
         wrapper.addView(TextView(this).apply {
             this.text = ts
@@ -402,6 +404,77 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(Color.RED)
             }
         }
+    }
+
+    private fun buildImageFileCard(filePath: String, isOutgoing: Boolean): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(16, 12, 16, 12)
+            setBackgroundColor(
+                if (isOutgoing) Color.parseColor("#0f3460") else Color.parseColor("#1a3a1a")
+            )
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.gravity = if (isOutgoing) android.view.Gravity.END else android.view.Gravity.START }
+        }
+
+        // Icon
+        card.addView(TextView(this).apply {
+            text = "🖼️"
+            textSize = 28f
+            setPadding(0, 0, 12, 0)
+        })
+
+        val info = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        info.addView(TextView(this).apply {
+            text = if (isOutgoing) "Image sent" else "Image received"
+            textSize = 13f
+            setTextColor(Color.WHITE)
+        })
+        info.addView(TextView(this).apply {
+            text = "Tap to open"
+            textSize = 10f
+            setTextColor(Color.parseColor("#00d4ff"))
+        })
+        card.addView(info)
+
+        // Tap to open in gallery/viewer
+        card.setOnClickListener {
+            try {
+                val file = java.io.File(filePath)
+                if (!file.exists()) { toast("File not found: $filePath"); return@setOnClickListener }
+                // Copy to external storage so viewer can access it
+                val destDir = android.os.Environment.getExternalStoragePublicDirectory(
+                    android.os.Environment.DIRECTORY_PICTURES)
+                val destFile = java.io.File(destDir, file.name)
+                destDir.mkdirs()
+                file.copyTo(destFile, overwrite = true)
+                // Trigger media scan
+                sendBroadcast(android.content.Intent(
+                    android.content.Intent.ACTION_MEDIA_SCANNER_SCAN_FILE,
+                    android.net.Uri.fromFile(destFile)
+                ))
+                // Open with viewer
+                val uri = androidx.core.content.FileProvider.getUriForFile(
+                    this, "${packageName}.fileprovider", destFile)
+                val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "image/webp")
+                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                if (intent.resolveActivity(packageManager) != null) {
+                    startActivity(intent)
+                } else {
+                    toast("No image viewer found")
+                }
+            } catch (e: Exception) {
+                toast("Could not open image: ${e.message}")
+            }
+        }
+        return card
     }
 
     // ── Announce cards ────────────────────────────────────────────────────────
