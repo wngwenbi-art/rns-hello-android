@@ -526,6 +526,12 @@ def _startup_announce_loop():
                 RNS.log(f"Startup re-announce at +{delay}s")
             except Exception as e:
                 RNS.log(f"Re-announce error at +{delay}s: {e}")
+        if image_destination:
+            try:
+                image_destination.announce()
+                RNS.log(f"Image re-announce at +{delay}s")
+            except Exception as e:
+                RNS.log(f"Image re-announce error: {e}")
 
     while True:
         time.sleep(600)  # 10 minutes
@@ -535,6 +541,12 @@ def _startup_announce_loop():
                 RNS.log("Periodic re-announce sent (10 min)")
             except Exception as e:
                 RNS.log(f"Periodic re-announce error: {e}")
+        if image_destination:
+            try:
+                image_destination.announce()
+                RNS.log("Periodic image re-announce sent")
+            except Exception as e:
+                RNS.log(f"Periodic image re-announce error: {e}")
 
 def _rns_main(bt_socket_wrapper):
     global destination, lxmf_router, reticulum
@@ -663,6 +675,11 @@ def announce():
             destination.announce()
             addr = RNS.prettyhexrep(destination.hash).strip("<>")
             RNS.log(f"Manual announce sent: {addr}")
+            # Also announce image destination so peers can find our image hash
+            if image_destination:
+                image_destination.announce()
+                img_addr = RNS.prettyhexrep(image_destination.hash).strip("<>")
+                RNS.log(f"Image destination re-announced: {img_addr}")
             return f"Announced! {addr}"
         return "Not ready yet"
     except Exception as e:
@@ -768,30 +785,17 @@ def send_image(dest_hash_hex, webp_b64):
             img_dest_hex = image_peer_hashes.get(dest_hash_hex)
             recalled_identity = known_identities.get(dest_hash_hex)
 
-        # Debug: log what we know
+        # Must use the exact hash from their rnshello.image announce —
+        # deriving from identity gives the wrong hash because image_destination
+        # uses a DIFFERENT identity (the image_destination identity, not lxmf).
         RNS.log(f"image_peer_hashes keys: {list(image_peer_hashes.keys())}")
         RNS.log(f"img_dest_hex for peer: {img_dest_hex}")
 
         if img_dest_hex is None:
-            # Never received their rnshello.image announce yet
-            # Try to derive it directly from their identity if we have it
-            if recalled_identity is not None:
-                try:
-                    derived = RNS.Destination(
-                        recalled_identity,
-                        RNS.Destination.OUT,
-                        RNS.Destination.SINGLE,
-                        "rnshello", "image"
-                    )
-                    img_dest_hex = RNS.prettyhexrep(derived.hash).strip("<>")
-                    RNS.log(f"Derived image hash from identity: {img_dest_hex}")
-                except Exception as e:
-                    RNS.log(f"Could not derive image hash: {e}")
-
-        if img_dest_hex is None:
+            # Haven't received their image announce yet — request it
             RNS.Transport.request_path(bytes.fromhex(dest_hash_hex))
-            return ("Image destination unknown — wait for peer to announce "
-                    "or ask them to tap Announce first")
+            return ("Image destination unknown — ask peer to tap Announce, "
+                    "then try again")
 
         if recalled_identity is None:
             recalled_identity = RNS.Identity.recall(bytes.fromhex(dest_hash_hex))
