@@ -230,6 +230,7 @@ class AndroidBTInterface(Interface):
 
     def process_outgoing(self, data):
         try:
+            RNS.log(f"TX len={len(data)} first2={data[:2].hex()}")
             self._socket.write(kiss_cmd(CMD_DATA, data))
             self.txb += len(data)
         except Exception as e:
