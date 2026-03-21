@@ -67,6 +67,16 @@ RNS_CONFIG = """
 
 [interfaces]
 
+  [[RNodeBT]]
+    type = RNodeInterface
+    interface_enabled = True
+    port = __FD_PATH__
+    frequency = {frequency}
+    bandwidth = {bandwidth}
+    txpower = {txpower}
+    spreadingfactor = {sf}
+    codingrate = {cr}
+
 """
 
 KISS_FEND       = 0xC0
@@ -610,11 +620,18 @@ def _rns_main(bt_socket_wrapper):
             f.write(rns_cfg)
         RNS.log("RNS config written")
 
-        # 3. Create BT socketpair bridge and RNodeInterface
+        # 3. Create BT socketpair — gives us an fd we can pass as a "serial port"
         rni_sock = _create_bt_socketpair(bt_socket_wrapper)
         time.sleep(0.3)  # Wait for bridge threads
 
-        # 4. Suppress signal() calls — on a background thread
+        # 4. Write final config with actual fd path BEFORE Reticulum init
+        fd_path = f"/proc/self/fd/{rni_sock.fileno()}"
+        rns_cfg_final = rns_cfg.replace("__FD_PATH__", fd_path)
+        with open(os.path.join(configdir, "config"), "w") as cf:
+            cf.write(rns_cfg_final)
+        RNS.log(f"Config written with fd path: {fd_path}")
+
+        # 5. Suppress signal() calls — on a background thread
         original_signal = signal.signal
         signal.signal = _noop_signal
 
@@ -640,24 +657,9 @@ def _rns_main(bt_socket_wrapper):
             except Exception as se:
                 RNS.log(f"Identity save error: {se}")
 
-        # 5. Init Reticulum — RNodeInterface reads config and connects to TCP bridge
+        # 6. Init Reticulum — RNodeInterface reads config, opens fd_path as serial port
         reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
-
-        # Create RNodeInterface using our socketpair fd as the port
-        # RNodeInterface expects a serial-port-like object; we pass the socket fd
-        import RNS.Interfaces.RNodeInterface as _RNI
-        iface = _RNI.RNodeInterface(
-            RNS.Transport,
-            "RNodeBT",
-            port           = rni_sock,
-            frequency      = cfg["frequency"],
-            bandwidth      = cfg["bandwidth"],
-            txpower        = cfg["txpower"],
-            spreadingfactor= cfg["sf"],
-            codingrate     = cfg["cr"],
-        )
-        RNS.Transport.interfaces.append(iface)
-        RNS.log(f"RNodeInterface created. Interfaces: {[i.name for i in RNS.Transport.interfaces]}")
+        RNS.log(f"Reticulum init done. Interfaces: {[i.name for i in RNS.Transport.interfaces]}")
         signal.signal = original_signal
 
         # LXMRouter also calls signal.signal internally — keep noop active through init
