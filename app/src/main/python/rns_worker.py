@@ -57,7 +57,8 @@ chat_messages = deque(maxlen=500)   # FIX: was unbounded list, now capped
 seen_announces = []
 known_identities  = {}  # plain hex (no <>) -> RNS.Identity
 active_links      = {}  # plain hex -> RNS.Link (most recent active link per peer)
-image_peer_hashes = {}  # lxmf_hash -> rnshello.image destination hash
+image_peer_hashes = {}
+active_links      = {}   # peer_hash -> active RNS.Link  # lxmf_hash -> rnshello.image destination hash
 
 RNS_CONFIG = """
 [reticulum]
@@ -450,14 +451,26 @@ class ImageAnnounceHandler:
 def incoming_link_established(link):
     """
     Called when a remote peer opens a link to our LXMF destination.
-    Used by LXMRouter internally — we just log it.
+    Store it in active_links so send_image can reuse it.
     """
     peer_hash = None
     try:
-        peer_hash = RNS.prettyhexrep(link.destination.hash).strip("<>")
+        remote_id = link.get_remote_identity()
+        if remote_id:
+            peer_hash = RNS.prettyhexrep(remote_id.hash).strip("<>")
     except Exception:
         pass
     RNS.log(f"LXMF incoming link from {peer_hash}")
+    if peer_hash:
+        with _data_lock:
+            active_links[peer_hash] = link
+        def on_close(lnk):
+            with _data_lock:
+                if active_links.get(peer_hash) is lnk:
+                    del active_links[peer_hash]
+        link.set_link_closed_callback(on_close)
+        link.set_resource_strategy(RNS.Link.ACCEPT_ALL)
+        RNS.log(f"Stored active link for {peer_hash}")
 
 def image_link_established(link):
     """
