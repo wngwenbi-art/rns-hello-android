@@ -13,18 +13,6 @@ from collections import deque
 # packet takes ~0.8s to TX. Round-trip for link handshake = 6-12s minimum.
 # Patch here so it applies to every Link object created anywhere in this process.
 def _patch_rns_for_lora():
-    # Patch Link.validate_proof to log verification result
-    try:
-        _orig_validate = RNS.Link.validate_proof
-        def _patched_validate(self, packet):
-            result = _orig_validate(self, packet)
-            RNS.log(f"validate_proof result={result} link_state={self.status}")
-            return result
-        RNS.Link.validate_proof = _patched_validate
-        RNS.log("Patched Link.validate_proof for debugging")
-    except Exception as e:
-        RNS.log(f"Could not patch validate_proof: {e}")
-
     patched = []
     for _attr in ["ESTABLISHMENT_TIMEOUT_PER_HOP", "LINK_ESTABLISHMENT_TIMEOUT",
                   "establishment_timeout_per_hop", "TIMEOUT_PER_HOP"]:
@@ -215,12 +203,6 @@ class AndroidBTInterface(Interface):
         if len(pkt) > 0:
             self.rxb += len(pkt)
             try:
-                import hashlib as _hl
-                if pkt[0] == 0x02:  # LINKREQUEST — log its hash (= link_id)
-                    link_id = _hl.sha256(pkt).digest()[:16].hex()
-                    RNS.log(f"RX LINKREQUEST link_id={link_id}")
-                elif pkt[0] == 0x0f or pkt[0] == 0x03:  # PROOF
-                    RNS.log(f"RX PROOF first16={pkt[3:19].hex()}")  # link_id in proof header
                 self.owner.inbound(pkt, self)
             except Exception as e:
                 RNS.log(f"inbound error: {e}")
@@ -251,7 +233,6 @@ class AndroidBTInterface(Interface):
 
     def process_outgoing(self, data):
         try:
-            RNS.log(f"TX len={len(data)} first2={data[:2].hex()}")
             self._socket.write(kiss_cmd(CMD_DATA, data))
             self.txb += len(data)
         except Exception as e:
@@ -668,12 +649,12 @@ def _rns_main(bt_socket_wrapper):
         # Patch LXMF retry interval to be longer than link establishment timeout
         # Default is 4s which causes constant new link requests before proof arrives
         try:
-            LXMF.LXMRouter.DELIVERY_RETRY_WAIT = 90
-            RNS.log("Patched LXMF DELIVERY_RETRY_WAIT=90s")
+            LXMF.LXMRouter.DELIVERY_RETRY_WAIT = 15
+            RNS.log("Patched LXMF DELIVERY_RETRY_WAIT=15s")
         except Exception as e:
             RNS.log(f"Could not patch DELIVERY_RETRY_WAIT: {e}")
         try:
-            lxmf_router.delivery_retry_wait = 90
+            lxmf_router.delivery_retry_wait = 15
         except Exception:
             pass
         signal.signal = original_signal
