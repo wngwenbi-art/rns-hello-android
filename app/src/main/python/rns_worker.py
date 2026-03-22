@@ -647,18 +647,41 @@ def _rns_main(bt_socket_wrapper):
             storagepath="/data/data/com.example.rnshello/files/lxmf",
             autopeer=True
         )
-        signal.signal = original_signal
-        # MAX_DELIVERY_ATTEMPTS — increase for LoRa reliability
+        # Patch LXMF retry interval to be longer than link establishment timeout
+        # Default is 4s which causes constant new link requests before proof arrives
         try:
-            LXMF.LXMRouter.MAX_DELIVERY_ATTEMPTS = 20
-            RNS.log("Patched LXMF MAX_DELIVERY_ATTEMPTS=20")
+            LXMF.LXMRouter.DELIVERY_RETRY_WAIT = 90
+            RNS.log("Patched LXMF DELIVERY_RETRY_WAIT=90s")
         except Exception as e:
-            RNS.log(f"Could not patch MAX_DELIVERY_ATTEMPTS: {e}")
+            RNS.log(f"Could not patch DELIVERY_RETRY_WAIT: {e}")
+        try:
+            lxmf_router.delivery_retry_wait = 90
+        except Exception:
+            pass
+        signal.signal = original_signal
+        # Patch LXMF constants for LoRa reliability
+        # DELIVERY_RETRY_WAIT must be > LoRa RTT (~3s) to avoid link collision
+        # where sender opens new link before proof from previous attempt arrives
+        for attr, val, desc in [
+            ("MAX_DELIVERY_ATTEMPTS", 20,  "max retries"),
+            ("DELIVERY_RETRY_WAIT",   30,  "seconds between retries (must be > LoRa RTT)"),
+            ("OUTBOUND_PROCESSING_INTERVAL", 4, "outbound processing interval"),
+        ]:
+            try:
+                old_val = getattr(LXMF.LXMRouter, attr, None)
+                if old_val is not None:
+                    setattr(LXMF.LXMRouter, attr, val)
+                    RNS.log(f"Patched LXMF.{attr}: {old_val}→{val} ({desc})")
+            except Exception as e:
+                RNS.log(f"Could not patch LXMF.{attr}: {e}")
 
         destination = lxmf_router.register_delivery_identity(
             identity,
             display_name="RNS Hello Android"
         )
+        lxmf_dest_hash = RNS.prettyhexrep(destination.hash).strip("<>")
+        id_hash = RNS.prettyhexrep(identity.hash).strip("<>")
+        RNS.log(f"LXMF dest={lxmf_dest_hash} identity={id_hash}")
         destination.set_proof_strategy(RNS.Destination.PROVE_ALL)
         destination.set_link_established_callback(incoming_link_established)
         lxmf_router.register_delivery_callback(message_received)
