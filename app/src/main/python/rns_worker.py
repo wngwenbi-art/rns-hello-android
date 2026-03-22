@@ -185,6 +185,7 @@ class AndroidBTInterface(Interface):
 
     def start_reading(self):
         """Start the BT read loop. Call this AFTER RNS.Reticulum() init."""
+        self._flush_until = time.time() + 2.0  # Discard stale packets for first 2s
         threading.Thread(target=self._read_loop, daemon=True).start()
         RNS.log(f"AndroidBTInterface read loop started for {self.name}")
 
@@ -201,6 +202,10 @@ class AndroidBTInterface(Interface):
     def _deliver(self, pkt):
         """Pass a packet to RNS Transport."""
         if len(pkt) > 0:
+            # Discard packets during startup flush window (clears RNode buffer)
+            if hasattr(self, '_flush_until') and time.time() < self._flush_until:
+                RNS.log(f"Discarding buffered packet (flush window) len={len(pkt)}")
+                return
             self.rxb += len(pkt)
             try:
                 self.owner.inbound(pkt, self)
@@ -568,23 +573,11 @@ def _rns_main(bt_socket_wrapper):
     try:
         configure_rnode(bt_socket_wrapper)
 
-        # Flush any stale packets buffered in the RNode from previous sessions.
-        # Without this, old link requests arrive and get processed against
-        # the new session's pending links, causing link ID mismatches.
-        RNS.log("Flushing RNode receive buffer...")
+        # Brief pause to let any RNode-buffered packets from previous sessions arrive,
+        # then the interface read loop will discard them during its startup flush period
+        RNS.log("Waiting 2s for RNode buffer to clear...")
         import time as _time
-        _flush_start = _time.time()
-        _flushed = 0
-        while _time.time() - _flush_start < 3.0:
-            try:
-                raw = bt_socket_wrapper.read(4096)
-                if raw:
-                    _flushed += len(raw)
-                else:
-                    break
-            except Exception:
-                break
-        RNS.log(f"RNode buffer flushed: {_flushed} bytes discarded")
+        _time.sleep(2.0)
 
         configdir = "/data/data/com.example.rnshello/files/.reticulum"
         os.makedirs(configdir, exist_ok=True)
