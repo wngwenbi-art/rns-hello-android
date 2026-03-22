@@ -568,6 +568,24 @@ def _rns_main(bt_socket_wrapper):
     try:
         configure_rnode(bt_socket_wrapper)
 
+        # Flush any stale packets buffered in the RNode from previous sessions.
+        # Without this, old link requests arrive and get processed against
+        # the new session's pending links, causing link ID mismatches.
+        RNS.log("Flushing RNode receive buffer...")
+        import time as _time
+        _flush_start = _time.time()
+        _flushed = 0
+        while _time.time() - _flush_start < 3.0:
+            try:
+                raw = bt_socket_wrapper.read(4096)
+                if raw:
+                    _flushed += len(raw)
+                else:
+                    break
+            except Exception:
+                break
+        RNS.log(f"RNode buffer flushed: {_flushed} bytes discarded")
+
         configdir = "/data/data/com.example.rnshello/files/.reticulum"
         os.makedirs(configdir, exist_ok=True)
         with open(os.path.join(configdir, "config"), "w") as f:
