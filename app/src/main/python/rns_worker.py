@@ -13,6 +13,18 @@ from collections import deque
 # packet takes ~0.8s to TX. Round-trip for link handshake = 6-12s minimum.
 # Patch here so it applies to every Link object created anywhere in this process.
 def _patch_rns_for_lora():
+    # Patch Link.validate_proof to log verification result
+    try:
+        _orig_validate = RNS.Link.validate_proof
+        def _patched_validate(self, packet):
+            result = _orig_validate(self, packet)
+            RNS.log(f"validate_proof result={result} link_state={self.status}")
+            return result
+        RNS.Link.validate_proof = _patched_validate
+        RNS.log("Patched Link.validate_proof for debugging")
+    except Exception as e:
+        RNS.log(f"Could not patch validate_proof: {e}")
+
     patched = []
     for _attr in ["ESTABLISHMENT_TIMEOUT_PER_HOP", "LINK_ESTABLISHMENT_TIMEOUT",
                   "establishment_timeout_per_hop", "TIMEOUT_PER_HOP"]:
@@ -203,6 +215,12 @@ class AndroidBTInterface(Interface):
         if len(pkt) > 0:
             self.rxb += len(pkt)
             try:
+                import hashlib as _hl
+                if pkt[0] == 0x02:  # LINKREQUEST — log its hash (= link_id)
+                    link_id = _hl.sha256(pkt).digest()[:16].hex()
+                    RNS.log(f"RX LINKREQUEST link_id={link_id}")
+                elif pkt[0] == 0x0f or pkt[0] == 0x03:  # PROOF
+                    RNS.log(f"RX PROOF first16={pkt[3:19].hex()}")  # link_id in proof header
                 self.owner.inbound(pkt, self)
             except Exception as e:
                 RNS.log(f"inbound error: {e}")
