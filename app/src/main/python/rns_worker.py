@@ -60,6 +60,28 @@ active_links      = {}  # plain hex -> RNS.Link (most recent active link per pee
 image_peer_hashes = {}
 active_links      = {}   # peer_hash -> active RNS.Link  # lxmf_hash -> rnshello.image destination hash
 
+_IMAGES_DIR = "/data/data/com.example.rnshello/files/images"
+
+def _save_image_file(img_bytes: bytes, sender: str) -> str:
+    """
+    Save raw image bytes to a file in the app's private images directory.
+    Returns the absolute file path, or empty string on failure.
+    sender is used only for logging.
+    """
+    try:
+        os.makedirs(_IMAGES_DIR, exist_ok=True)
+        ts_tag = time.strftime("%Y%m%d_%H%M%S")
+        filename = f"img_{sender[:8]}_{ts_tag}.webp"
+        filepath = os.path.join(_IMAGES_DIR, filename)
+        with open(filepath, "wb") as f:
+            f.write(img_bytes)
+        kb = len(img_bytes) / 1024
+        RNS.log(f"Image saved: {filepath} ({kb:.1f} KB)")
+        return filepath
+    except Exception as e:
+        RNS.log(f"_save_image_file error: {e}")
+        return ""
+
 RNS_CONFIG = """
 [reticulum]
   enable_transport = yes
@@ -248,26 +270,48 @@ def message_received(message):
     sender = RNS.prettyhexrep(message.source_hash).strip("<>")
     ts = time.strftime("%H:%M:%S")
 
-    # ── Check for image field first (Sideband-compatible) ────────────────────
-    # 'ia' is the standard image field key in LXMF
-    # Format: [format_string, raw_bytes]  e.g. ["jpg", b"..."]
+    # ── Check for image field first ───────────────────────────────────────────
+    # Two possible encodings we must handle:
+    #
+    # 1. Numeric key 6  — Sideband / Columba standard
+    #    fields[6] = raw bytes  (no wrapper list)
+    #
+    # 2. String key "ia" — our own legacy format
+    #    fields["ia"] = [format_string, raw_bytes]
     try:
         fields = message.fields or {}
-        if "ia" in fields:
+
+        img_bytes = None
+        img_src   = None
+
+        # Try field 6 first (standard)
+        raw6 = fields.get(6)
+        if raw6 is None:
+            raw6 = fields.get("6")   # in case key arrived as string
+        if isinstance(raw6, (bytes, bytearray)) and len(raw6) > 0:
+            img_bytes = bytes(raw6)
+            img_src   = "field_6"
+
+        # Fall back to legacy "ia" format
+        if img_bytes is None and "ia" in fields:
             image_field = fields["ia"]
-            img_fmt   = image_field[0]   # e.g. "jpg", "webp", "png"
-            img_bytes = image_field[1]
-            if isinstance(img_bytes, (bytes, bytearray)) and len(img_bytes) > 0:
-                RNS.log(f"IMG RECEIVED (LXMF ia) from {sender}: {img_fmt} {len(img_bytes)}B")
-                filepath = _save_image_file(bytes(img_bytes), sender)
-                with _data_lock:
-                    chat_messages.append({
-                        "from": sender,
-                        "text": f"IMG_FILE:{filepath}",
-                        "ts": ts,
-                        "direction": "in"
-                    })
-                return
+            if isinstance(image_field, (list, tuple)) and len(image_field) >= 2:
+                raw_ia = image_field[1]
+                if isinstance(raw_ia, (bytes, bytearray)) and len(raw_ia) > 0:
+                    img_bytes = bytes(raw_ia)
+                    img_src   = "ia"
+
+        if img_bytes is not None:
+            RNS.log(f"IMG RECEIVED ({img_src}) from {sender}: {len(img_bytes)}B")
+            filepath = _save_image_file(img_bytes, sender)
+            with _data_lock:
+                chat_messages.append({
+                    "from": sender,
+                    "text": f"IMG_FILE:{filepath}" if filepath else "📷 Image received",
+                    "ts": ts,
+                    "direction": "in"
+                })
+            return
     except Exception as e:
         RNS.log(f"Image field parse error: {e}")
 
@@ -852,10 +896,9 @@ def send_message(dest_hash_hex, text):
 
 def send_image(dest_hash_hex, webp_b64):
     """
-    Send an image via LXMF using the 'ia' (image attachment) field.
-    This is exactly how Sideband sends images — no separate link needed,
+    Send an image via LXMF using standard field key 6 (Sideband / Columba compatible).
     LXMF handles routing, retries and delivery confirmation.
-    Format: field key 'ia', value ['webp', raw_bytes]
+    Field 6 value is raw image bytes with no wrapper list.
     """
     import base64 as _b64
     global lxmf_router, destination
@@ -887,7 +930,9 @@ def send_image(dest_hash_hex, webp_b64):
             "",
             desired_method=LXMF.LXMessage.OPPORTUNISTIC
         )
-        msg.fields = {"ia": ["webp", img_bytes]}
+        # Field 6 is the standard LXMF image attachment key (Sideband / Columba compatible).
+        # Value is raw bytes — no wrapper list, no format string.
+        msg.fields = {6: img_bytes}
 
         def delivery_cb(m):
             RNS.log(f"Image LXMF delivery state: {m.state}")
@@ -907,7 +952,7 @@ def send_image(dest_hash_hex, webp_b64):
 
         msg.register_delivery_callback(delivery_cb)
         lxmf_router.handle_outbound(msg)
-        RNS.log(f"Image queued via LXMF ia field ({kb:.1f} KB)")
+        RNS.log(f"Image queued via LXMF field 6 ({kb:.1f} KB)")
 
         # Show optimistic sent bubble immediately
         try:
