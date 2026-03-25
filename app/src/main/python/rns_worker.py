@@ -924,24 +924,11 @@ def send_image(dest_hash_hex, webp_b64):
             "lxmf", "delivery"
         )
 
-        # Ensure a path exists before attempting DIRECT delivery.
-        # On LoRa, link establishment requires a known path — without it the
-        # link stays "pending" forever and the image never sends.
-        if not RNS.Transport.has_path(lxmf_dest.hash):
-            RNS.log("send_image: no path known, requesting before send...")
-            RNS.Transport.request_path(lxmf_dest.hash)
-            time.sleep(2.0)  # give LoRa time to propagate path response
-
-        # Use DIRECT (not OPPORTUNISTIC) for images — DIRECT tells LXMF to
-        # establish a link first, then stream the payload as a Resource transfer.
-        # OPPORTUNISTIC tries to fit everything in one packet which is too large
-        # for LoRa, causing LXMF to silently fall back to a link it never
-        # establishes, leaving the message stuck in "pending" forever.
         msg = LXMF.LXMessage(
             lxmf_dest,
             destination,
             "",
-            desired_method=LXMF.LXMessage.DIRECT
+            desired_method=LXMF.LXMessage.OPPORTUNISTIC
         )
         # Field 6 is the standard LXMF image attachment key (Sideband / Columba compatible).
         # Value is raw bytes — no wrapper list, no format string.
