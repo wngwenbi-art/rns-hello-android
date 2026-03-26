@@ -192,10 +192,25 @@ def configure_rnode(socket):
     time.sleep(0.2)
     RNS.log("RNode radio configured and ON")
 
+def _lora_bitrate(bandwidth: int, spreading_factor: int, coding_rate: int) -> int:
+    """
+    Calculate the effective LoRa data rate in bits/second.
+    Formula:  Rs = BW / 2^SF  (chips/sec)
+              Rb = Rs * SF * (4 / (4 + CR))  (bits/sec)
+    where CR is the denominator of the coding rate fraction 4/CR.
+    This matches the calculation used by RNodeInterface in Reticulum.
+    """
+    try:
+        symbol_rate = bandwidth / (2 ** spreading_factor)
+        bit_rate    = symbol_rate * spreading_factor * (4 / (4 + coding_rate))
+        return max(int(bit_rate), 1)
+    except Exception:
+        return 1200   # safe fallback
+
 class AndroidBTInterface(Interface):
     BITRATE_GUESS = 1200
 
-    def __init__(self, owner, name, socket):
+    def __init__(self, owner, name, socket, bandwidth=31250, spreading_factor=8, coding_rate=6):
         super().__init__()
         self.owner                  = owner
         self.name                   = name
@@ -207,7 +222,10 @@ class AndroidBTInterface(Interface):
         self.FWD                    = False
         self.RPT                    = False
         self._socket                = socket
-        self.bitrate                = self.BITRATE_GUESS
+        # Compute real on-air bitrate from LoRa parameters so RNS path table
+        # records the correct bitrate for get_first_hop_timeout calculations.
+        self.bitrate                = _lora_bitrate(bandwidth, spreading_factor, coding_rate)
+        RNS.log(f"AndroidBTInterface bitrate: {self.bitrate} bps (BW={bandwidth} SF={spreading_factor} CR={coding_rate})")
         self.ingress_control        = False
         self.ic_max_held_announces  = 0
         self.ic_burst_hold_time     = 0
@@ -297,8 +315,46 @@ class AndroidBTInterface(Interface):
         try:
             self._socket.write(kiss_cmd(CMD_DATA, data))
             self.txb += len(data)
+            # After sending, immediately extend the timeout on every pending link.
+            # This runs at exactly the right moment: the link object exists and
+            # its timer is running, but no proof has arrived yet.
+            self._extend_pending_link_timeouts()
         except Exception as e:
             RNS.log(f"BT write error: {e}")
+
+    @staticmethod
+    def _extend_pending_link_timeouts():
+        """Force establishment_timeout = 120s on every pending RNS Link."""
+        TARGET = 120.0
+        extended = 0
+        try:
+            # RNS stores pending links in Transport.pending_links (dict or list
+            # depending on version). Try both forms.
+            pending = None
+            if hasattr(RNS.Transport, 'pending_links'):
+                pending = RNS.Transport.pending_links
+            elif hasattr(RNS.Transport, 'link_table'):
+                pending = RNS.Transport.link_table
+
+            if isinstance(pending, dict):
+                links = list(pending.values())
+            elif isinstance(pending, (list, set)):
+                links = list(pending)
+            else:
+                links = []
+
+            for link in links:
+                try:
+                    cur = getattr(link, 'establishment_timeout', None)
+                    if cur is not None and cur < TARGET:
+                        link.establishment_timeout = TARGET
+                        extended += 1
+                except Exception:
+                    pass
+        except Exception as e:
+            RNS.log(f"extend_pending_link_timeouts error: {e}")
+        if extended:
+            RNS.log(f"Extended establishment_timeout to {TARGET}s on {extended} pending link(s)")
 
 def message_received(message):
     import base64 as _b64
@@ -719,17 +775,52 @@ def _rns_main(bt_socket_wrapper):
         reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
         RNS.log(f"Reticulum init done. Interfaces before add: {[i.name for i in RNS.Transport.interfaces]}")
 
-        # ── Re-apply LoRa timeout patches AFTER Reticulum init ────────────────
-        # Called again here because RNS.Reticulum.__init__ may reset class
-        # constants. The monkey-patch on Link.__init__ is idempotent (guarded).
+        # ── Re-apply LoRa class-constant patches AFTER Reticulum init ──────────
+        # Belt-and-suspenders: RNS.Reticulum.__init__ may reset class constants.
+        # The primary fix is get_first_hop_timeout above; this covers any other
+        # timeout path that reads class constants directly.
         _patch_rns_for_lora()
-        RNS.log("Post-init LoRa timeout patches applied")
+        RNS.log("Post-init LoRa patches applied")
 
         # Register interface AFTER Reticulum init — Reticulum.start() rebuilds
         # Transport.interfaces from config, so pre-registered interfaces get cleared.
-        iface = AndroidBTInterface(RNS.Transport, "RNodeBT", bt_socket_wrapper)
+        import rnode_config as _rncfg
+        _cfg = _rncfg.get()
+        iface = AndroidBTInterface(
+            RNS.Transport, "RNodeBT", bt_socket_wrapper,
+            bandwidth=_cfg["bandwidth"],
+            spreading_factor=_cfg["sf"],
+            coding_rate=_cfg["cr"],
+        )
         RNS.Transport.interfaces.append(iface)
         RNS.log(f"Interface registered. Interfaces now: {[i.name for i in RNS.Transport.interfaces]}")
+
+        # ── Patch Transport.get_first_hop_timeout for LoRa ────────────────────
+        # RNS uses get_first_hop_timeout(hops) to set the link establishment
+        # deadline. The default implementation looks up the first-hop interface
+        # bitrate from the path table. Because we add our interface manually
+        # (not via config), path entries may not carry a bitrate, causing RNS
+        # to fall back to ESTABLISHMENT_TIMEOUT_PER_HOP * hops = 1.0s.
+        #
+        # At 1200 bps the link proof (118 bytes) takes ~0.8s to arrive, so 1s
+        # is only barely enough — any jitter kills the link.
+        #
+        # We patch get_first_hop_timeout to return a value derived from the
+        # actual interface bitrate: time to TX one MTU (500 bytes) * 4 * hops.
+        # At 1200 bps: (500*8/1200) * 4 * 1 hop ≈ 13.3s. We floor at 15s.
+        _iface_bitrate = iface.bitrate
+
+        def _lora_get_first_hop_timeout(hops):
+            mtu_tx_time = (RNS.Reticulum.MTU * 8) / _iface_bitrate
+            timeout = max(mtu_tx_time * 4 * max(hops, 1), 15.0)
+            return timeout
+
+        try:
+            RNS.Transport.get_first_hop_timeout = staticmethod(_lora_get_first_hop_timeout)
+            RNS.log(f"Patched Transport.get_first_hop_timeout → LoRa formula "
+                    f"(1-hop = {_lora_get_first_hop_timeout(1):.1f}s)")
+        except Exception as _pe:
+            RNS.log(f"Could not patch get_first_hop_timeout: {_pe}")
 
         iface.start_reading()
         RNS.log("BT read loop started")
