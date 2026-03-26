@@ -1,4 +1,4 @@
-Set-Content app/src/main/python/reticulum_wrapper.py @'
+# Set-Content app/src/main/python/reticulum_wrapper.py @'
 import RNS
 import LXMF
 import os
