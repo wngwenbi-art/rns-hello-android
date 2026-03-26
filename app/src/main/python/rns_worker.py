@@ -13,39 +13,64 @@ from collections import deque
 # packet takes ~0.8s to TX. Round-trip for link handshake = 6-12s minimum.
 # Patch here so it applies to every Link object created anywhere in this process.
 def _patch_rns_for_lora():
-    patched = []
-    # Try every known attribute name across RNS versions.
-    # 120s gives LoRa two full round-trips at 1200 baud with margin.
-    TIMEOUT_VAL = 120.0
-    for _attr in [
-        "ESTABLISHMENT_TIMEOUT_PER_HOP",
-        "LINK_ESTABLISHMENT_TIMEOUT",
-        "establishment_timeout_per_hop",
-        "TIMEOUT_PER_HOP",
-        "link_establishment_timeout",
-    ]:
-        for _obj, _name in [(RNS.Link, "RNS.Link"), (RNS.Transport, "RNS.Transport")]:
+    """
+    Patch RNS link establishment timeout for LoRa.
+
+    The problem: RNS.Link.__init__ computes self.establishment_timeout from
+    the class constant at construction time. Even if we set the class constant,
+    RNS.Reticulum.__init__ may rebuild internal state that resets it.
+
+    The solution: wrap RNS.Link.__init__ so every newly created Link object
+    gets establishment_timeout forced to LORA_LINK_TIMEOUT regardless of what
+    the class constant says.  This is the only reliable approach across all
+    RNS versions.
+    """
+    LORA_LINK_TIMEOUT  = 120.0   # seconds — two full LoRa RTTs with margin
+    LORA_KEEPALIVE     = 360     # seconds
+
+    # Also set class constants as belt-and-suspenders
+    patched_class = []
+    for _obj, _name in [(RNS.Link, "RNS.Link"), (RNS.Transport, "RNS.Transport")]:
+        for _attr in [
+            "ESTABLISHMENT_TIMEOUT_PER_HOP", "LINK_ESTABLISHMENT_TIMEOUT",
+            "establishment_timeout_per_hop", "TIMEOUT_PER_HOP",
+            "link_establishment_timeout",
+        ]:
             try:
                 old = getattr(_obj, _attr, None)
                 if old is not None:
-                    setattr(_obj, _attr, TIMEOUT_VAL)
-                    patched.append(f"{_name}.{_attr}: {old}→{TIMEOUT_VAL}")
+                    setattr(_obj, _attr, LORA_LINK_TIMEOUT)
+                    patched_class.append(f"{_name}.{_attr}: {old}→{LORA_LINK_TIMEOUT}")
             except Exception:
                 pass
-    # Also patch keepalive — default fires too quickly during Resource transfer
-    KEEPALIVE_VAL = 360
+
     for _attr in ["KEEPALIVE_TIMEOUT_FACTOR", "KEEPALIVE", "keepalive"]:
         try:
             old = getattr(RNS.Link, _attr, None)
             if old is not None:
-                setattr(RNS.Link, _attr, KEEPALIVE_VAL)
-                patched.append(f"RNS.Link.{_attr}: {old}→{KEEPALIVE_VAL}")
+                setattr(RNS.Link, _attr, LORA_KEEPALIVE)
+                patched_class.append(f"RNS.Link.{_attr}: {old}→{LORA_KEEPALIVE}")
         except Exception:
             pass
-    if patched:
-        RNS.log("LoRa patches applied: " + ", ".join(patched))
+
+    # Monkey-patch Link.__init__ to force establishment_timeout on every instance
+    _original_link_init = RNS.Link.__init__
+
+    def _patched_link_init(self, *args, **kwargs):
+        _original_link_init(self, *args, **kwargs)
+        # Override whatever the constructor computed
+        if not hasattr(self, 'establishment_timeout') or self.establishment_timeout < LORA_LINK_TIMEOUT:
+            self.establishment_timeout = LORA_LINK_TIMEOUT
+
+    # Guard: only patch once (module is imported once but _rns_main may retry)
+    if not getattr(RNS.Link.__init__, '_lora_patched', False):
+        RNS.Link.__init__ = _patched_link_init
+        RNS.Link.__init__._lora_patched = True
+        patched_class.append(f"RNS.Link.__init__ monkey-patched (establishment_timeout→{LORA_LINK_TIMEOUT})")
+
+    if patched_class:
+        RNS.log("LoRa patches applied: " + ", ".join(patched_class))
     else:
-        # Log all Link attrs so we know what's available next time
         attrs = [f"{a}={getattr(RNS.Link,a)}" for a in dir(RNS.Link)
                  if not a.startswith("_") and isinstance(getattr(RNS.Link,a,None),(int,float))]
         RNS.log("WARNING: No timeout attrs patched. RNS.Link numeric attrs: " + str(attrs))
@@ -695,22 +720,9 @@ def _rns_main(bt_socket_wrapper):
         RNS.log(f"Reticulum init done. Interfaces before add: {[i.name for i in RNS.Transport.interfaces]}")
 
         # ── Re-apply LoRa timeout patches AFTER Reticulum init ────────────────
-        # RNS.Reticulum.__init__ may reset class-level constants, so we must
-        # patch here (post-init) in addition to the module-level call.
-        # We also patch via Transport directly for newer RNS versions that read
-        # the value from there.
+        # Called again here because RNS.Reticulum.__init__ may reset class
+        # constants. The monkey-patch on Link.__init__ is idempotent (guarded).
         _patch_rns_for_lora()
-        # Belt-and-suspenders: also set on Transport if the attribute exists
-        for _attr, _val in [
-            ("ESTABLISHMENT_TIMEOUT_PER_HOP", 60.0),
-            ("link_establishment_timeout",    60.0),
-        ]:
-            try:
-                if hasattr(RNS.Transport, _attr):
-                    setattr(RNS.Transport, _attr, _val)
-                    RNS.log(f"Transport.{_attr} → {_val}")
-            except Exception:
-                pass
         RNS.log("Post-init LoRa timeout patches applied")
 
         # Register interface AFTER Reticulum init — Reticulum.start() rebuilds
