@@ -14,28 +14,38 @@ from collections import deque
 # Patch here so it applies to every Link object created anywhere in this process.
 def _patch_rns_for_lora():
     patched = []
-    for _attr in ["ESTABLISHMENT_TIMEOUT_PER_HOP", "LINK_ESTABLISHMENT_TIMEOUT",
-                  "establishment_timeout_per_hop", "TIMEOUT_PER_HOP"]:
-        try:
-            old = getattr(RNS.Link, _attr, None)
-            if old is not None:
-                setattr(RNS.Link, _attr, 60.0)
-                patched.append(f"RNS.Link.{_attr}: {old}→60.0")
-        except Exception:
-            pass
+    # Try every known attribute name across RNS versions.
+    # 120s gives LoRa two full round-trips at 1200 baud with margin.
+    TIMEOUT_VAL = 120.0
+    for _attr in [
+        "ESTABLISHMENT_TIMEOUT_PER_HOP",
+        "LINK_ESTABLISHMENT_TIMEOUT",
+        "establishment_timeout_per_hop",
+        "TIMEOUT_PER_HOP",
+        "link_establishment_timeout",
+    ]:
+        for _obj, _name in [(RNS.Link, "RNS.Link"), (RNS.Transport, "RNS.Transport")]:
+            try:
+                old = getattr(_obj, _attr, None)
+                if old is not None:
+                    setattr(_obj, _attr, TIMEOUT_VAL)
+                    patched.append(f"{_name}.{_attr}: {old}→{TIMEOUT_VAL}")
+            except Exception:
+                pass
     # Also patch keepalive — default fires too quickly during Resource transfer
+    KEEPALIVE_VAL = 360
     for _attr in ["KEEPALIVE_TIMEOUT_FACTOR", "KEEPALIVE", "keepalive"]:
         try:
             old = getattr(RNS.Link, _attr, None)
             if old is not None:
-                setattr(RNS.Link, _attr, 360)   # 6 minutes
-                patched.append(f"RNS.Link.{_attr}: {old}→360")
+                setattr(RNS.Link, _attr, KEEPALIVE_VAL)
+                patched.append(f"RNS.Link.{_attr}: {old}→{KEEPALIVE_VAL}")
         except Exception:
             pass
     if patched:
         RNS.log("LoRa patches applied: " + ", ".join(patched))
     else:
-        # Log all Link attrs so we know what's available
+        # Log all Link attrs so we know what's available next time
         attrs = [f"{a}={getattr(RNS.Link,a)}" for a in dir(RNS.Link)
                  if not a.startswith("_") and isinstance(getattr(RNS.Link,a,None),(int,float))]
         RNS.log("WARNING: No timeout attrs patched. RNS.Link numeric attrs: " + str(attrs))
@@ -271,37 +281,52 @@ def message_received(message):
     ts = time.strftime("%H:%M:%S")
 
     # ── Check for image field first ───────────────────────────────────────────
-    # Two possible encodings we must handle:
-    #
-    # 1. Numeric key 6  — Sideband / Columba standard
-    #    fields[6] = raw bytes  (no wrapper list)
-    #
-    # 2. String key "ia" — our own legacy format
-    #    fields["ia"] = [format_string, raw_bytes]
+    # Field 6 is the LXMF standard image attachment key (Sideband / Columba).
+    # The key can arrive as int 6 or string "6" depending on the msgpack decoder.
+    # The value can be:
+    #   - raw bytes                    (our own sends, most common)
+    #   - memoryview                   (some RNS/LXMF versions)
+    #   - list/tuple [fmt, bytes]      (legacy "ia" style on field 6)
+    #   - list/tuple [bytes]           (single-element wrapper)
+    # We also fall back to the legacy "ia" string key.
     try:
         fields = message.fields or {}
 
         img_bytes = None
         img_src   = None
 
-        # Try field 6 first (standard)
-        raw6 = fields.get(6)
+        def _coerce_to_bytes(val):
+            """Return bytes from any of the forms LXMF might deliver."""
+            if isinstance(val, (bytes, bytearray)):
+                return bytes(val)
+            if isinstance(val, memoryview):
+                return bytes(val)
+            if isinstance(val, (list, tuple)):
+                # [fmt_str, data] or [data] or [data, ...]
+                for item in val:
+                    result = _coerce_to_bytes(item)
+                    if result and len(result) > 4:   # skip tiny format strings
+                        return result
+            return None
+
+        # Try int key 6 first, then string key "6"
+        raw6 = fields.get(6) if isinstance(fields, dict) else None
         if raw6 is None:
-            raw6 = fields.get("6")   # in case key arrived as string
-        if isinstance(raw6, (bytes, bytearray)) and len(raw6) > 0:
-            img_bytes = bytes(raw6)
-            img_src   = "field_6"
+            raw6 = fields.get("6")
+        if raw6 is not None:
+            img_bytes = _coerce_to_bytes(raw6)
+            if img_bytes:
+                img_src = "field_6"
 
-        # Fall back to legacy "ia" format
-        if img_bytes is None and "ia" in fields:
-            image_field = fields["ia"]
-            if isinstance(image_field, (list, tuple)) and len(image_field) >= 2:
-                raw_ia = image_field[1]
-                if isinstance(raw_ia, (bytes, bytearray)) and len(raw_ia) > 0:
-                    img_bytes = bytes(raw_ia)
-                    img_src   = "ia"
+        # Fall back to legacy "ia" string key
+        if img_bytes is None:
+            raw_ia = fields.get("ia")
+            if raw_ia is not None:
+                img_bytes = _coerce_to_bytes(raw_ia)
+                if img_bytes:
+                    img_src = "ia"
 
-        if img_bytes is not None:
+        if img_bytes and len(img_bytes) > 4:
             RNS.log(f"IMG RECEIVED ({img_src}) from {sender}: {len(img_bytes)}B")
             filepath = _save_image_file(img_bytes, sender)
             with _data_lock:
@@ -312,6 +337,9 @@ def message_received(message):
                     "direction": "in"
                 })
             return
+        elif fields:
+            # Log what we actually got so we can diagnose further
+            RNS.log(f"MSG fields present but no image found. keys={list(fields.keys())} types={[(k, type(v).__name__) for k,v in fields.items()]}")
     except Exception as e:
         RNS.log(f"Image field parse error: {e}")
 
@@ -666,6 +694,25 @@ def _rns_main(bt_socket_wrapper):
         reticulum = RNS.Reticulum(configdir=configdir, loglevel=RNS.LOG_DEBUG)
         RNS.log(f"Reticulum init done. Interfaces before add: {[i.name for i in RNS.Transport.interfaces]}")
 
+        # ── Re-apply LoRa timeout patches AFTER Reticulum init ────────────────
+        # RNS.Reticulum.__init__ may reset class-level constants, so we must
+        # patch here (post-init) in addition to the module-level call.
+        # We also patch via Transport directly for newer RNS versions that read
+        # the value from there.
+        _patch_rns_for_lora()
+        # Belt-and-suspenders: also set on Transport if the attribute exists
+        for _attr, _val in [
+            ("ESTABLISHMENT_TIMEOUT_PER_HOP", 60.0),
+            ("link_establishment_timeout",    60.0),
+        ]:
+            try:
+                if hasattr(RNS.Transport, _attr):
+                    setattr(RNS.Transport, _attr, _val)
+                    RNS.log(f"Transport.{_attr} → {_val}")
+            except Exception:
+                pass
+        RNS.log("Post-init LoRa timeout patches applied")
+
         # Register interface AFTER Reticulum init — Reticulum.start() rebuilds
         # Transport.interfaces from config, so pre-registered interfaces get cleared.
         iface = AndroidBTInterface(RNS.Transport, "RNodeBT", bt_socket_wrapper)
@@ -878,7 +925,7 @@ def send_message(dest_hash_hex, text):
             destination,
             text,
             title="",
-            desired_method=LXMF.LXMessage.OPPORTUNISTIC
+            desired_method=LXMF.LXMessage.DIRECT
         )
         msg.register_delivery_callback(lambda m: RNS.log(f"Delivered! state={m.state}"))
         msg.register_failed_callback(lambda m: RNS.log(f"Failed! state={m.state}"))
@@ -928,7 +975,7 @@ def send_image(dest_hash_hex, webp_b64):
             lxmf_dest,
             destination,
             "",
-            desired_method=LXMF.LXMessage.OPPORTUNISTIC
+            desired_method=LXMF.LXMessage.DIRECT
         )
         # Field 6 is the standard LXMF image attachment key (Sideband / Columba compatible).
         # Value is raw bytes — no wrapper list, no format string.
@@ -937,20 +984,21 @@ def send_image(dest_hash_hex, webp_b64):
         def delivery_cb(m):
             RNS.log(f"Image LXMF delivery state: {m.state}")
             if m.state == LXMF.LXMessage.DELIVERED:
-                try:
-                    sent_path = _save_image_file(img_bytes, "me")
-                except Exception:
-                    sent_path = ""
-                ts = time.strftime("%H:%M:%S")
-                with _data_lock:
-                    chat_messages.append({
-                        "from": "me",
-                        "text": f"IMG_FILE:{sent_path}" if sent_path else "📷 Image sent",
-                        "ts": ts,
-                        "direction": "out"
-                    })
+                RNS.log(f"Image delivered to {dest_hash_hex}")
+
+        def failed_cb(m):
+            RNS.log(f"Image delivery FAILED state={m.state} to {dest_hash_hex}")
+            ts_f = time.strftime("%H:%M:%S")
+            with _data_lock:
+                chat_messages.append({
+                    "from": "me",
+                    "text": f"📷 Image send failed — retry or move closer",
+                    "ts": ts_f,
+                    "direction": "out"
+                })
 
         msg.register_delivery_callback(delivery_cb)
+        msg.register_failed_callback(failed_cb)
         lxmf_router.handle_outbound(msg)
         RNS.log(f"Image queued via LXMF field 6 ({kb:.1f} KB)")
 

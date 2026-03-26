@@ -705,32 +705,45 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Compress a bitmap for LoRa radio transmission.
-     * Mirrors Sideband's strategy exactly:
-     *   - Scale longest side to 320 px (thumbnail)
-     *   - Encode as WebP at quality 22 — far smaller than JPEG at same visual quality
-     *   - WebP on Android is supported natively from API 17+
+     * Target: ≤ 4 KB so the image fits within a single LXMF link transfer
+     * at SF8 / 31.25 kHz (≈ 1200 baud effective throughput).
      *
-     * Typical output: 3–8 KB, well within LXMF link transfer budget.
+     * Strategy:
+     *   - Scale longest side to 180 px  (enough detail for a thumbnail)
+     *   - Encode as WebP at quality 12  (aggressive but still recognisable)
+     *   - If result > 4 KB, re-encode at quality 5 as a safety net
+     *
+     * Typical output: 1.5–3.5 KB.
      */
     private fun compressToBase64(bmp: android.graphics.Bitmap): String {
-        val maxDim = 320
+        val maxDim = 180
         val scaled = if (bmp.width > maxDim || bmp.height > maxDim) {
             val ratio = maxDim.toFloat() / maxOf(bmp.width, bmp.height)
             android.graphics.Bitmap.createScaledBitmap(
                 bmp,
-                (bmp.width * ratio).toInt(),
-                (bmp.height * ratio).toInt(),
+                (bmp.width * ratio).toInt().coerceAtLeast(1),
+                (bmp.height * ratio).toInt().coerceAtLeast(1),
                 true
             )
         } else bmp
 
-        val out = ByteArrayOutputStream()
-        scaled.compress(android.graphics.Bitmap.CompressFormat.WEBP, 22, out)
+        var out = ByteArrayOutputStream()
+        scaled.compress(android.graphics.Bitmap.CompressFormat.WEBP, 12, out)
+
+        // Safety net: if still > 4 KB, crush harder
+        if (out.size() > 4 * 1024) {
+            out = ByteArrayOutputStream()
+            scaled.compress(android.graphics.Bitmap.CompressFormat.WEBP, 5, out)
+        }
+
         val bytes = out.toByteArray()
         val kb = bytes.size / 1024f
-        android.util.Log.d("RNSHello", "Image compressed: ${kb.toInt()} KB (WebP q22 @ ${scaled.width}×${scaled.height})")
+        android.util.Log.d("RNSHello", "Image compressed: ${"%.1f".format(kb)} KB (WebP @ ${scaled.width}×${scaled.height})")
         return android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
     }
+
+    /** Estimate LoRa transfer time: 1200 baud effective, 8-bit bytes, ~25% protocol overhead. */
+    private fun loraEstimateSecs(kb: Int): Int = ((kb * 1024 * 8 * 1.25) / 1200).toInt().coerceAtLeast(5)
 
     private fun handleImageResult(bmp: android.graphics.Bitmap) {
         val dest = etDestHash.text.toString().trim()
@@ -740,8 +753,8 @@ class MainActivity : AppCompatActivity() {
         scope.launch(Dispatchers.IO) {
             val b64 = compressToBase64(bmp)
             val kb  = (b64.length * 3 / 4) / 1024
+            val estSecs = loraEstimateSecs(kb)
             withContext(Dispatchers.Main) {
-                // Show preview + confirm dialog
                 val preview = ImageView(this@MainActivity).apply {
                     val previewBytes = android.util.Base64.decode(b64, android.util.Base64.NO_WRAP)
                     setImageBitmap(BitmapFactory.decodeByteArray(previewBytes, 0, previewBytes.size))
@@ -749,18 +762,17 @@ class MainActivity : AppCompatActivity() {
                     setPadding(16, 16, 16, 8)
                 }
                 AlertDialog.Builder(this@MainActivity)
-                    .setTitle("Send image? (~${kb} KB — WebP)")
-                    .setMessage("Sending over LoRa takes 30–90 seconds. Keep both devices close and radio on.")
+                    .setTitle("Send image? (~${kb} KB)")
+                    .setMessage("Estimated transfer time: ~${estSecs}s at 1200 baud LoRa.\nKeep both devices close with radio on.")
                     .setView(preview)
                     .setPositiveButton("📤 Send") { _, _ ->
                         scope.launch(Dispatchers.IO) {
                             val result = RNSBridge.sendImage(dest, b64)
                             withContext(Dispatchers.Main) {
                                 toast(result)
-                                if (result.startsWith("Image sent")) {
-                                    lastMessageCount = 0
-                                    refreshMessages()
-                                }
+                                // Refresh immediately so the outgoing bubble appears
+                                lastMessageCount = 0
+                                refreshMessages()
                             }
                         }
                     }
