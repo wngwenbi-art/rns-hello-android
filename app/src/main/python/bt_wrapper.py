@@ -1,4 +1,3 @@
-# Set-Content app/src/main/python/reticulum_wrapper.py @'
 import RNS
 import LXMF
 import os
@@ -46,7 +45,8 @@ class ReticulumWrapper:
         self.msg_callback = callback
 
     def set_bridge(self, bridge):
-        if self.rns_instance is None: return
+        if self.rns_instance is None: 
+            return
             
         self.rnode_interface = ColumbaRNodeInterface(
             owner=self.rns_instance,
@@ -148,4 +148,3 @@ def get_instance(storage_path=None):
     if _global_wrapper_instance is None:
         _global_wrapper_instance = ReticulumWrapper(storage_path)
     return _global_wrapper_instance
-'@
