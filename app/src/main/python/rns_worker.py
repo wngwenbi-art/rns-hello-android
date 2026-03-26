@@ -554,6 +554,19 @@ def announce_received(destination_hash, announced_identity, app_data):
         with _data_lock:
             known_identities[hash_str] = announced_identity
         RNS.log(f"Identity stored for {hash_str}")
+
+    # ── Tear down any stale cached link to this peer ──────────────────────────
+    # LXMF caches link objects and reuses them across delivery attempts.
+    # If the peer has restarted or the previous link timed out on their end,
+    # LXMF will keep trying to send on a link the peer no longer recognises,
+    # and the link will stay PENDING forever.
+    # A fresh announce from a peer is proof they are alive with a clean state,
+    # so we close any existing link to them to force a fresh handshake.
+    try:
+        _tear_down_stale_links(hash_str)
+    except Exception as _e:
+        RNS.log(f"Stale link teardown error: {_e}")
+
     entry = {"hash": hash_str, "name": name, "ts": ts}
     with _data_lock:
         for i, a in enumerate(seen_announces):
@@ -561,6 +574,37 @@ def announce_received(destination_hash, announced_identity, app_data):
                 seen_announces[i] = entry
                 return
         seen_announces.append(entry)
+
+def _tear_down_stale_links(peer_hash_hex: str):
+    """
+    Close any pending or active RNS links to peer_hash_hex.
+    Called when a fresh announce arrives — the peer has a clean link table,
+    so any link object we hold is stale and must be discarded.
+    """
+    closed = 0
+    try:
+        # Walk every link RNS Transport knows about
+        for link_table_attr in ["links", "pending_links", "active_links", "link_table"]:
+            table = getattr(RNS.Transport, link_table_attr, None)
+            if table is None:
+                continue
+            links = list(table.values()) if isinstance(table, dict) else list(table)
+            for link in links:
+                try:
+                    # Match by remote destination hash
+                    dest_hash = None
+                    if hasattr(link, 'destination') and link.destination is not None:
+                        dest_hash = RNS.prettyhexrep(link.destination.hash).strip("<>")
+                    if dest_hash == peer_hash_hex:
+                        RNS.log(f"Tearing down stale link {RNS.prettyhexrep(link.link_id)} to {peer_hash_hex[:8]}")
+                        link.teardown()
+                        closed += 1
+                except Exception:
+                    pass
+    except Exception as e:
+        RNS.log(f"_tear_down_stale_links error: {e}")
+    if closed:
+        RNS.log(f"Closed {closed} stale link(s) to {peer_hash_hex[:8]} after fresh announce")
 
 class AnnounceHandler:
     aspect_filter = "lxmf.delivery"
