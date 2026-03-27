@@ -313,11 +313,11 @@ class AndroidBTInterface(Interface):
 
     def start_reading(self):
         """Start the BT read loop. Call this AFTER RNS.Reticulum() init."""
-        # Flush window must be longer than the configure_rnode drain (3s) plus
-        # the radio-on settle time (1.5s) plus margin — 8s is safe.
-        self._flush_until = time.time() + 8.0
+        # No flush window needed — configure_rnode already drained the RNode
+        # buffer before we got here. A time-based flush window here would
+        # silently discard live link proofs from the peer.
         threading.Thread(target=self._read_loop, daemon=True).start()
-        RNS.log(f"AndroidBTInterface read loop started, flush window 8s")
+        RNS.log(f"AndroidBTInterface read loop started for {self.name}")
 
     def _read_loop(self):
         while self.online:
@@ -332,10 +332,6 @@ class AndroidBTInterface(Interface):
     def _deliver(self, pkt):
         """Pass a packet to RNS Transport."""
         if len(pkt) > 0:
-            # Discard packets during startup flush window (clears RNode buffer)
-            if hasattr(self, '_flush_until') and time.time() < self._flush_until:
-                RNS.log(f"Discarding buffered packet (flush window) len={len(pkt)}")
-                return
             self.rxb += len(pkt)
             try:
                 self.owner.inbound(pkt, self)
