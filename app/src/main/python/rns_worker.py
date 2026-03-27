@@ -144,6 +144,44 @@ CMD_DETECT      = 0x08
 CMD_READY       = 0x0F
 RADIO_STATE_ON  = 0x01
 
+# RNode status/telemetry ports (inbound only — RNode sends these, we never send them)
+# These appear in the log as 0x20-0x28 range frames.
+CMD_STAT_RSSI   = 0x21   # RSSI of last received packet
+CMD_STAT_SNR    = 0x22   # SNR of last received packet
+CMD_STAT_AIRTIME= 0x23   # Airtime stats
+CMD_STAT_RX     = 0x24   # RX stats
+CMD_STAT_TX     = 0x25   # TX stats / radio state echo
+CMD_STAT_BLINK  = 0x26   # LED blink
+CMD_STAT_RANDOM = 0x27   # Random seed
+CMD_STAT_MISC   = 0x28   # Miscellaneous status
+
+def _drain_rnode_buffer(socket, drain_secs: float = 3.0):
+    """
+    Read and discard everything the RNode sends for drain_secs seconds.
+    Delegates to BtWrapper.drain() which uses the 2s socket timeout so
+    the loop always terminates — it never hangs waiting for bytes.
+    """
+    RNS.log(f"Draining RNode buffer for {drain_secs}s...")
+    try:
+        discarded = socket.drain(drain_secs)
+        RNS.log(f"RNode buffer drain complete: discarded {discarded} bytes")
+    except AttributeError:
+        # Fallback if an older BtWrapper without drain() is in use
+        RNS.log("BtWrapper.drain() not available — using fallback drain")
+        import time as _t
+        deadline = _t.time() + drain_secs
+        discarded = 0
+        while _t.time() < deadline:
+            try:
+                data = socket.read(512)
+                if data:
+                    discarded += len(data)
+                else:
+                    _t.sleep(0.1)
+            except Exception:
+                _t.sleep(0.1)
+        RNS.log(f"Fallback drain complete: {discarded} bytes")
+
 def kiss_escape(data):
     out = []
     for b in data:
@@ -167,13 +205,26 @@ def configure_rnode(socket):
     sf    = cfg["sf"]
     cr    = cfg["cr"]
     RNS.log(f"Configuring RNode: freq={freq} bw={bw} tx={txpwr} sf={sf} cr={cr}")
-    # 1. Detect / wake RNode
+
+    # ── Step 0: Hard buffer flush ──────────────────────────────────────────────
+    # Force radio OFF first, then drain everything the RNode sends back.
+    # This clears any TX-queued packets from the previous session (old link
+    # requests, stale data frames) so they don't collide with fresh ones.
+    # Without this, reinstalling the app gets a new identity but the RNode still
+    # replays the old session's half-completed link handshakes.
+    socket.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x00])))  # radio OFF
+    time.sleep(0.5)
+    _drain_rnode_buffer(socket, drain_secs=3.0)             # eat everything
+
+    # ── Step 1: Detect / wake ──────────────────────────────────────────────────
     socket.write(kiss_cmd(CMD_DETECT, bytes([0x00])))
     time.sleep(0.3)
-    # 2. Radio OFF — clean slate
+
+    # ── Step 2: Radio OFF again — clean slate after detect response ────────────
     socket.write(kiss_cmd(CMD_RADIO_STATE, bytes([0x00])))
-    time.sleep(0.8)
-    # 3. Set params from saved config
+    time.sleep(0.5)
+
+    # ── Step 3: Set radio parameters ──────────────────────────────────────────
     socket.write(kiss_cmd(CMD_FREQUENCY, struct.pack(">I", freq)))
     time.sleep(0.2)
     socket.write(kiss_cmd(CMD_BANDWIDTH, struct.pack(">I", bw)))
@@ -184,13 +235,15 @@ def configure_rnode(socket):
     time.sleep(0.2)
     socket.write(kiss_cmd(CMD_CR, bytes([cr])))
     time.sleep(0.2)
-    # 4. Radio ON — starts RX immediately
+
+    # ── Step 4: Radio ON ──────────────────────────────────────────────────────
     socket.write(kiss_cmd(CMD_RADIO_STATE, bytes([RADIO_STATE_ON])))
     time.sleep(1.5)
-    # 5. Signal ready
+
+    # ── Step 5: Signal ready ──────────────────────────────────────────────────
     socket.write(kiss_cmd(CMD_READY, bytes([0x00])))
     time.sleep(0.2)
-    RNS.log("RNode radio configured and ON")
+    RNS.log("RNode configured and ON — buffer flushed, fresh session ready")
 
 def _lora_bitrate(bandwidth: int, spreading_factor: int, coding_rate: int) -> int:
     """
@@ -260,9 +313,11 @@ class AndroidBTInterface(Interface):
 
     def start_reading(self):
         """Start the BT read loop. Call this AFTER RNS.Reticulum() init."""
-        self._flush_until = time.time() + 2.0  # Discard stale packets for first 2s
+        # Flush window must be longer than the configure_rnode drain (3s) plus
+        # the radio-on settle time (1.5s) plus margin — 8s is safe.
+        self._flush_until = time.time() + 8.0
         threading.Thread(target=self._read_loop, daemon=True).start()
-        RNS.log(f"AndroidBTInterface read loop started for {self.name}")
+        RNS.log(f"AndroidBTInterface read loop started, flush window 8s")
 
     def _read_loop(self):
         while self.online:
@@ -890,6 +945,24 @@ def _rns_main(bt_socket_wrapper):
                 RNS.log(f"Saved new identity: {RNS.prettyhexrep(identity.hash)}")
             except Exception as se:
                 RNS.log(f"Identity save error: {se}")
+
+        # ── Clear LXMF outbound queue from previous sessions ─────────────────
+        # The LXMF router persists undelivered messages to disk and replays them
+        # on startup. When the app is reinstalled (new identity, new destination
+        # hashes), those queued messages belong to a defunct identity and will
+        # never deliver — but LXMF keeps retrying them, polluting the log and
+        # consuming airtime. Wipe the outbound dir before creating the router.
+        _lxmf_outbound = "/data/data/com.example.rnshello/files/lxmf/outbound"
+        _lxmf_tmp      = "/data/data/com.example.rnshello/files/lxmf/tmp"
+        import shutil as _shutil
+        for _stale_dir in [_lxmf_outbound, _lxmf_tmp]:
+            try:
+                if os.path.exists(_stale_dir):
+                    _shutil.rmtree(_stale_dir)
+                    os.makedirs(_stale_dir, exist_ok=True)
+                    RNS.log(f"Cleared LXMF queue dir: {_stale_dir}")
+            except Exception as _e:
+                RNS.log(f"Could not clear {_stale_dir}: {_e}")
 
         lxmf_router = LXMF.LXMRouter(
             storagepath="/data/data/com.example.rnshello/files/lxmf",

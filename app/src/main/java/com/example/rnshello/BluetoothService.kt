@@ -34,6 +34,22 @@ class BluetoothService {
             val s = device.createRfcommSocketToServiceRecord(SPP_UUID)
             adapter.cancelDiscovery()
             s.connect()
+            // Set a read timeout so read() never blocks indefinitely.
+            // 2000ms: long enough to receive a full LoRa packet (118 bytes at
+            // 1200 bps ≈ 800ms) but short enough that the drain loop and the
+            // read loop can react to silence within a reasonable time.
+            try { s.inputStream } // ensure stream is opened before setSoTimeout
+            catch (_: Exception) {}
+            try {
+                // BluetoothSocket wraps a real socket — access via reflection
+                val field = s.javaClass.getDeclaredField("mSocket")
+                field.isAccessible = true
+                val rawSocket = field.get(s) as? java.net.Socket
+                rawSocket?.soTimeout = 2000  // 2 second read timeout
+                Log.i(TAG, "BT socket read timeout set to 2000ms")
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not set socket timeout (non-fatal): ${e.message}")
+            }
             socket = s
             inputStream = s.inputStream
             outputStream = s.outputStream
@@ -80,12 +96,20 @@ class BluetoothService {
             } else {
                 buf.copyOf(n)
             }
+        } catch (e: java.net.SocketTimeoutException) {
+            // Normal: no data arrived within the 2s timeout — not an error
+            ByteArray(0)
         } catch (e: Exception) {
             Log.w(TAG, "BT read error: ${e.message}")
             triggerReconnect()
             ByteArray(0)
         }
     }
+
+    /** Returns the number of bytes available to read without blocking. */
+    fun available(): Int = try {
+        inputStream?.available() ?: 0
+    } catch (_: Exception) { 0 }
 
     // write() NEVER blocks for reconnect — just throws so Python logs it and moves on
     fun write(data: ByteArray) {
